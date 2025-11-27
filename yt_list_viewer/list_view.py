@@ -22,6 +22,35 @@ except Exception:
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 
+# 設定ファイル（最後に使ったフォルダAの保存先）
+CONFIG_PATH = Path.home() / ".video_browser_gui.json"
+
+
+# ------------------ 設定ファイルの読み書き ------------------ #
+def load_last_root() -> Optional[str]:
+    """前回使ったフォルダAのパスを設定ファイルから読み込む。"""
+    try:
+        if CONFIG_PATH.exists():
+            with CONFIG_PATH.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            root = data.get("last_root")
+            if isinstance(root, str) and root:
+                return root
+    except Exception:
+        pass
+    return None
+
+
+def save_last_root(path: Path) -> None:
+    """フォルダAのパスを設定ファイルに保存する。"""
+    try:
+        data = {"last_root": str(path)}
+        with CONFIG_PATH.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        # 保存失敗しても致命的ではないので無視
+        pass
+
 
 # ------------------ データ構造 ------------------ #
 @dataclass
@@ -216,6 +245,9 @@ class VideoBrowserGUI(ttk.Frame):
         self._thumb_cache: Dict[str, Any] = {}
         self._sort_state: Dict[str, bool] = {}  # 列ごとの昇順/降順
 
+        # 先に前回のフォルダを読み込んでおく
+        self._initial_root = load_last_root()
+
         self._build_widgets()
 
     # ---------- UI構築 ---------- #
@@ -242,6 +274,10 @@ class VideoBrowserGUI(ttk.Frame):
             bar, text="JSON出力", command=self.export_json, state=tk.DISABLED
         )
         self.export_json_btn.pack(side=tk.LEFT, padx=4)
+
+        # 前回のフォルダAがあれば自動セット
+        if self._initial_root:
+            self.root_var.set(self._initial_root)
 
         # === 検索バー ===
         sbar = ttk.Frame(self)
@@ -474,6 +510,9 @@ class VideoBrowserGUI(ttk.Frame):
         self.rows = rows
         self.view_rows = list(rows)
         self.refresh_tree()
+
+        # 成功したフォルダAを保存
+        save_last_root(root_path)
 
         self.set_progress(len(rows), max(1, len(rows)))
         self.scan_btn.configure(state=tk.NORMAL)
