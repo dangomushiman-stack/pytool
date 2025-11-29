@@ -19,6 +19,7 @@ import json
 import subprocess
 from pathlib import Path
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 try:
     import yt_dlp
@@ -61,7 +62,7 @@ def _probe_audio_codec(path: Path):
         "-select_streams", "a:0",
         "-show_entries", "stream=codec_name",
         "-of", "json",
-        str(path)
+        str(path),
     ]
     proc = _run(cmd)
     try:
@@ -103,7 +104,9 @@ def _plan_for(codec: str | None):
 
 def _extract_audio_copy(src: Path, dst: Path, plan: _Plan):
     """ffmpeg -vn -acodec copy + extra_args"""
-    cmd = ["ffmpeg", "-y", "-i", str(src), "-vn", "-acodec", "copy"] + plan.extra_args + [str(dst)]
+    cmd = ["ffmpeg", "-y", "-i", str(src), "-vn", "-acodec", "copy"] + plan.extra_args + [
+        str(dst)
+    ]
     proc = _run(cmd)
     ok = proc.returncode == 0 and dst.exists() and dst.stat().st_size > 0
     return ok, proc.stderr
@@ -145,16 +148,44 @@ def extract_all_mp4_audios(outdir: Path, log_cb=lambda s: None):
             log_cb(f"❌ 失敗しました。詳細: {err}")
 
 
-# ---------------------- 既存 GUI 本体 ----------------------
+# ---------------------- URL 関連ユーティリティ ----------------------
 def extract_youtube_id(url: str) -> str | None:
-    """YouTube URLから動画IDを抽出"""
+    """YouTube URLから動画IDを抽出（該当しないURLなら None）"""
     pattern = re.compile(
-        r'(?:https?://)?(?:www\.|m\.)?(?:youtube\.com/(?:watch\?v=|embed/|v/|shorts/)|youtu\.be/)([A-Za-z0-9_-]{11})'
+        r"(?:https?://)?(?:www\.|m\.)?(?:youtube\.com/(?:watch\?v=|embed/|v/|shorts/)|youtu\.be/)([A-Za-z0-9_-]{11})"
     )
     match = pattern.search(url)
     return match.group(1) if match else None
 
 
+def derive_savedir_from_url(url: str, base_outdir: str) -> str:
+    """
+    URL から保存先サブフォルダ名を決める。
+    - YouTube: 動画ID
+    - bilibili: bilibili_BVxxxxxx
+    - その他: パスを利用
+    """
+    # YouTube
+    vid = extract_youtube_id(url)
+    if vid:
+        sub = vid
+        return os.path.join(base_outdir, sub)
+
+    # bilibili（BV ID を抽出）
+    m = re.search(r"(BV[0-9A-Za-z]+)", url)
+    if m:
+        bv = m.group(1)  # BVxxxxxx
+        sub = f"bilibili_{bv}"
+        return os.path.join(base_outdir, sub)
+
+    # その他のサイト
+    parsed = urlparse(url)
+    path = parsed.path.strip("/") or "download"
+    sub = path.replace("/", "_")
+    return os.path.join(base_outdir, sub)
+
+
+# ---------------------- GUI 本体 ----------------------
 class YTDLPDownloaderGUI(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -172,7 +203,9 @@ class YTDLPDownloaderGUI(tk.Tk):
         frm_top = ttk.Frame(self, padding=12)
         frm_top.pack(fill=tk.X)
 
-        ttk.Label(frm_top, text="URL").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(frm_top, text="URL（YouTube / bilibili など）").grid(
+            row=0, column=0, sticky=tk.W
+        )
         self.var_url = tk.StringVar()
         ent_url = ttk.Entry(frm_top, textvariable=self.var_url)
         ent_url.grid(row=0, column=1, columnspan=3, sticky=tk.EW, padx=(6, 0))
@@ -199,7 +232,7 @@ class YTDLPDownloaderGUI(tk.Tk):
             grp_sel, text="動画（音声付き）", value="video", variable=self.var_content
         ).grid(row=0, column=0, sticky=tk.W)
         ttk.Radiobutton(
-            grp_sel, text="音声のみ（mp3）", value="audio", variable=self.var_content
+            grp_sel, text="音声のみ（bestaudio）", value="audio", variable=self.var_content
         ).grid(row=0, column=1, sticky=tk.W, padx=(16, 0))
         ttk.Radiobutton(
             grp_sel, text="動画のみ（無音）", value="video_only", variable=self.var_content
@@ -207,12 +240,12 @@ class YTDLPDownloaderGUI(tk.Tk):
 
         self.var_thumb = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            grp_sel, text="サムネイルも保存（.jpg）", variable=self.var_thumb
+            grp_sel, text="サムネイルも保存（.jpg 変換）", variable=self.var_thumb
         ).grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
 
         self.var_extra_audio = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            grp_sel, text="（動画選択時）別途 mp3 も保存", variable=self.var_extra_audio
+            grp_sel, text="（動画選択時）別途 audio も保存", variable=self.var_extra_audio
         ).grid(row=1, column=1, sticky=tk.W, pady=(8, 0))
 
         # 自動抽出のON/OFF（任意）
@@ -284,16 +317,8 @@ class YTDLPDownloaderGUI(tk.Tk):
         self.settings["last_outdir"] = outdir
         save_settings(self.settings)
 
-        # --- ここから追加：URL から動画ID取得＆保存先ディレクトリ決定 ---
-        vid = extract_youtube_id(url)
-        if not vid:
-            messagebox.showerror(
-                "URLエラー", "YouTube の動画IDをURLから取得できませんでした。URLを確認してください。"
-            )
-            return
-
-        # OS依存しない結合に変更（任意だが推奨）
-        savedir = os.path.join(outdir, vid)
+        # URL から保存フォルダを決定（YouTube / bilibili など共通）
+        savedir = derive_savedir_from_url(url, outdir)
 
         # 既存フォルダがある場合は確認ダイアログ
         if os.path.isdir(savedir):
@@ -306,9 +331,8 @@ class YTDLPDownloaderGUI(tk.Tk):
             if not proceed:
                 # ユーザーが中止を選択
                 return
-        # --- 追加ここまで ---
 
-        os.makedirs(outdir, exist_ok=True)
+        os.makedirs(savedir, exist_ok=True)
 
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("実行中", "前のダウンロードがまだ実行中です")
@@ -317,13 +341,15 @@ class YTDLPDownloaderGUI(tk.Tk):
         self.btn_start.configure(state="disabled")
         self.pb.configure(value=0)
         self.var_status.set("初期化中...")
-        self._log("==== ダウンロード開始 ====")
-        savedir = os.path.join(outdir, (extract_youtube_id(url) or "download"))
+        self._log(f"==== ダウンロード開始 ====\nURL: {url}\n保存先: {savedir}")
+
+        # メタ情報 JSON 保存
         try:
-            os.makedirs(savedir, exist_ok=True)
-        except Exception:
-            pass
-        self._json_download(url, savedir)
+            self._json_download(url, savedir)
+        except Exception as e:
+            self._log(f"メタ情報取得に失敗しました: {e}")
+
+        # ダウンロードワーカースレッド起動
         self.worker = threading.Thread(
             target=self.download_worker,
             args=(url, savedir, content, want_thumb, extra_audio),
@@ -354,7 +380,7 @@ class YTDLPDownloaderGUI(tk.Tk):
             )
 
         if content == "audio":
-            # 音声のみ（コンテナは元のまま / mp3化は別途を推奨）
+            # 音声のみ（bestaudio）
             ydl_opts.update(
                 {
                     "format": "bestaudio/best",
