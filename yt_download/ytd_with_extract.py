@@ -26,9 +26,33 @@ except Exception as e:
     raise SystemExit("yt-dlp がインポートできません。先に 'pip install yt-dlp' を実行してください")
 
 
+# ---------------------- 設定ファイルユーティリティ ----------------------
+SETTINGS_FILE = "settings.json"
+
+
+def load_settings():
+    if not os.path.exists(SETTINGS_FILE):
+        return {}
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings(data: dict):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        # 設定保存に失敗してもアプリ自体は続行する
+        pass
+
+
 # ---------------------- 事後抽出ユーティリティ（ffmpeg系） ----------------------
 def _run(cmd):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
 
 def _probe_audio_codec(path: Path):
     """先頭の音声ストリームの codec_name を返す。なければ None"""
@@ -49,10 +73,12 @@ def _probe_audio_codec(path: Path):
     except Exception:
         return None
 
+
 @dataclass
 class _Plan:
     ext: str
     extra_args: list
+
 
 # コーデック→出力先定義（無再エンコード）
 _CODEC_PLAN = {
@@ -66,6 +92,7 @@ _CODEC_PLAN = {
     "vorbis": _Plan(".ogg", ["-f", "ogg"]),
 }
 
+
 def _plan_for(codec: str | None):
     if not codec:
         return None
@@ -73,12 +100,14 @@ def _plan_for(codec: str | None):
         return _Plan(".wav", ["-f", "wav"])
     return _CODEC_PLAN.get(codec)
 
+
 def _extract_audio_copy(src: Path, dst: Path, plan: _Plan):
     """ffmpeg -vn -acodec copy + extra_args"""
     cmd = ["ffmpeg", "-y", "-i", str(src), "-vn", "-acodec", "copy"] + plan.extra_args + [str(dst)]
     proc = _run(cmd)
     ok = proc.returncode == 0 and dst.exists() and dst.stat().st_size > 0
     return ok, proc.stderr
+
 
 def extract_all_mp4_audios(outdir: Path, log_cb=lambda s: None):
     """outdir 直下の .mp4 を走査して音声を抽出（無再エンコード）。成功/失敗をログ"""
@@ -125,6 +154,7 @@ def extract_youtube_id(url: str) -> str | None:
     match = pattern.search(url)
     return match.group(1) if match else None
 
+
 class YTDLPDownloaderGUI(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -134,6 +164,9 @@ class YTDLPDownloaderGUI(tk.Tk):
 
         self.events = queue.Queue()  # ワーカー→UI
         self.worker: threading.Thread | None = None
+
+        # 設定読み込み
+        self.settings = load_settings()
 
         # --- 上段：URL 入力と保存先 ---
         frm_top = ttk.Frame(self, padding=12)
@@ -147,29 +180,48 @@ class YTDLPDownloaderGUI(tk.Tk):
         frm_top.columnconfigure(1, weight=1)
 
         ttk.Label(frm_top, text="保存先").grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
-        self.var_outdir = tk.StringVar(value=os.getcwd())
+
+        default_outdir = self.settings.get("last_outdir", os.getcwd())
+        self.var_outdir = tk.StringVar(value=default_outdir)
+
         ent_out = ttk.Entry(frm_top, textvariable=self.var_outdir)
         ent_out.grid(row=1, column=1, sticky=tk.EW, padx=(6, 4), pady=(8, 0))
-        ttk.Button(frm_top, text="参照...", command=self.browse_outdir).grid(row=1, column=2, sticky=tk.E, pady=(8, 0))
+        ttk.Button(frm_top, text="参照...", command=self.browse_outdir).grid(
+            row=1, column=2, sticky=tk.E, pady=(8, 0)
+        )
 
         # --- ダウンロード内容の選択 ---
         grp_sel = ttk.LabelFrame(self, text="ダウンロード内容", padding=12)
         grp_sel.pack(fill=tk.X, padx=12, pady=(4, 0))
 
         self.var_content = tk.StringVar(value="video")  # video / audio / video_only
-        ttk.Radiobutton(grp_sel, text="動画（音声付き）", value="video", variable=self.var_content).grid(row=0, column=0, sticky=tk.W)
-        ttk.Radiobutton(grp_sel, text="音声のみ（mp3）", value="audio", variable=self.var_content).grid(row=0, column=1, sticky=tk.W, padx=(16, 0))
-        ttk.Radiobutton(grp_sel, text="動画のみ（無音）", value="video_only", variable=self.var_content).grid(row=0, column=2, sticky=tk.W, padx=(16, 0))
+        ttk.Radiobutton(
+            grp_sel, text="動画（音声付き）", value="video", variable=self.var_content
+        ).grid(row=0, column=0, sticky=tk.W)
+        ttk.Radiobutton(
+            grp_sel, text="音声のみ（mp3）", value="audio", variable=self.var_content
+        ).grid(row=0, column=1, sticky=tk.W, padx=(16, 0))
+        ttk.Radiobutton(
+            grp_sel, text="動画のみ（無音）", value="video_only", variable=self.var_content
+        ).grid(row=0, column=2, sticky=tk.W, padx=(16, 0))
 
         self.var_thumb = tk.BooleanVar(value=True)
-        ttk.Checkbutton(grp_sel, text="サムネイルも保存（.jpg）", variable=self.var_thumb).grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
+        ttk.Checkbutton(
+            grp_sel, text="サムネイルも保存（.jpg）", variable=self.var_thumb
+        ).grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
 
         self.var_extra_audio = tk.BooleanVar(value=True)
-        ttk.Checkbutton(grp_sel, text="（動画選択時）別途 mp3 も保存", variable=self.var_extra_audio).grid(row=1, column=1, sticky=tk.W, pady=(8, 0))
+        ttk.Checkbutton(
+            grp_sel, text="（動画選択時）別途 mp3 も保存", variable=self.var_extra_audio
+        ).grid(row=1, column=1, sticky=tk.W, pady=(8, 0))
 
         # 自動抽出のON/OFF（任意）
         self.var_post_extract = tk.BooleanVar(value=True)
-        ttk.Checkbutton(grp_sel, text="ダウンロード後にMP4から音声を抽出（無再エンコード）", variable=self.var_post_extract).grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+        ttk.Checkbutton(
+            grp_sel,
+            text="ダウンロード後にMP4から音声を抽出（無再エンコード）",
+            variable=self.var_post_extract,
+        ).grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
 
         # --- 実行ボタン ---
         frm_btn = ttk.Frame(self, padding=(12, 0))
@@ -180,10 +232,14 @@ class YTDLPDownloaderGUI(tk.Tk):
         # --- 進捗 ---
         frm_prog = ttk.Frame(self, padding=12)
         frm_prog.pack(fill=tk.X)
-        self.pb = ttk.Progressbar(frm_prog, length=300, mode="determinate", maximum=100)
+        self.pb = ttk.Progressbar(
+            frm_prog, length=300, mode="determinate", maximum=100
+        )
         self.pb.pack(fill=tk.X)
         self.var_status = tk.StringVar(value="待機中")
-        ttk.Label(frm_prog, textvariable=self.var_status).pack(anchor=tk.W, pady=(6, 0))
+        ttk.Label(frm_prog, textvariable=self.var_status).pack(
+            anchor=tk.W, pady=(6, 0)
+        )
 
         # --- ログ ---
         frm_log = ttk.Frame(self, padding=(12, 0))
@@ -198,9 +254,16 @@ class YTDLPDownloaderGUI(tk.Tk):
 
     # ---------- UI handlers ----------
     def browse_outdir(self):
-        path = filedialog.askdirectory(initialdir=self.var_outdir.get() or os.path.expanduser("~"))
+        path = filedialog.askdirectory(
+            initialdir=self.var_outdir.get() or os.path.expanduser("~")
+        )
         if path:
             self.var_outdir.set(path)
+
+            # 設定に保存
+            self.settings = load_settings()
+            self.settings["last_outdir"] = path
+            save_settings(self.settings)
 
     def on_start(self):
         url = self.var_url.get().strip()
@@ -216,11 +279,17 @@ class YTDLPDownloaderGUI(tk.Tk):
             messagebox.showwarning("入力不足", "保存先フォルダを指定してください")
             return
 
+        # 保存先を設定ファイルに記録
+        self.settings = load_settings()
+        self.settings["last_outdir"] = outdir
+        save_settings(self.settings)
 
         # --- ここから追加：URL から動画ID取得＆保存先ディレクトリ決定 ---
         vid = extract_youtube_id(url)
         if not vid:
-            messagebox.showerror("URLエラー", "YouTube の動画IDをURLから取得できませんでした。URLを確認してください。")
+            messagebox.showerror(
+                "URLエラー", "YouTube の動画IDをURLから取得できませんでした。URLを確認してください。"
+            )
             return
 
         # OS依存しない結合に変更（任意だが推奨）
@@ -232,13 +301,12 @@ class YTDLPDownloaderGUI(tk.Tk):
                 "確認",
                 f"保存先「{savedir}」は既に存在します。\n"
                 "このままダウンロードを続行しますか？\n"
-                "（既存ファイルが上書き／追記される可能性があります）"
+                "（既存ファイルが上書き／追記される可能性があります）",
             )
             if not proceed:
                 # ユーザーが中止を選択
                 return
         # --- 追加ここまで ---
-
 
         os.makedirs(outdir, exist_ok=True)
 
@@ -264,7 +332,9 @@ class YTDLPDownloaderGUI(tk.Tk):
         self.worker.start()
 
     # ---------- Worker & yt-dlp ----------
-    def download_worker(self, url: str, outdir: str, content: str, want_thumb: bool, extra_audio: bool):
+    def download_worker(
+        self, url: str, outdir: str, content: str, want_thumb: bool, extra_audio: bool
+    ):
         def progress_hook(d: dict):
             self.events.put(("progress", d))
 
@@ -276,24 +346,32 @@ class YTDLPDownloaderGUI(tk.Tk):
 
         if want_thumb:
             ydl_opts["writethumbnail"] = True
-            ydl_opts.setdefault("postprocessors", []).append({
-                "key": "FFmpegThumbnailsConvertor",
-                "format": "jpg",
-            })
+            ydl_opts.setdefault("postprocessors", []).append(
+                {
+                    "key": "FFmpegThumbnailsConvertor",
+                    "format": "jpg",
+                }
+            )
 
         if content == "audio":
             # 音声のみ（コンテナは元のまま / mp3化は別途を推奨）
-            ydl_opts.update({
-                "format": "bestaudio/best",
-            })
+            ydl_opts.update(
+                {
+                    "format": "bestaudio/best",
+                }
+            )
         elif content == "video_only":
-            ydl_opts.update({
-                "format": "bv*",
-            })
+            ydl_opts.update(
+                {
+                    "format": "bv*",
+                }
+            )
         else:  # video
-            ydl_opts.update({
-                "format": "bv*+ba/b",
-            })
+            ydl_opts.update(
+                {
+                    "format": "bv*+ba/b",
+                }
+            )
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -358,7 +436,9 @@ class YTDLPDownloaderGUI(tk.Tk):
             self.pb.configure(value=percent_val)
             speed = d.get("_speed_str", "")
             eta = d.get("_eta_str", "")
-            self.var_status.set(f"ダウンロード中... {percent_str}  速度:{speed}  残り:{eta}")
+            self.var_status.set(
+                f"ダウンロード中... {percent_str}  速度:{speed}  残り:{eta}"
+            )
         elif status == "finished":
             self.var_status.set("結合/後処理中...")
         else:
@@ -371,7 +451,7 @@ class YTDLPDownloaderGUI(tk.Tk):
             "writethumbnail": True,
             "writesubtitles": True,
             "subtitleslangs": ["ja", "en"],
-            "cookiesfrombrowser": ("chrome",)
+            "cookiesfrombrowser": ("chrome",),
         }
         os.makedirs(path, exist_ok=True)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -394,7 +474,9 @@ class YTDLPDownloaderGUI(tk.Tk):
         outdir = payload.get("outdir")
         if self.var_post_extract.get() and outdir:
             self._log("（事後抽出）MP4から音声抽出を開始します...")
-            threading.Thread(target=self._post_extract_worker, args=(Path(outdir),), daemon=True).start()
+            threading.Thread(
+                target=self._post_extract_worker, args=(Path(outdir),), daemon=True
+            ).start()
 
     def _on_error(self, msg: str):
         self._log("エラー: " + str(msg))
@@ -411,6 +493,7 @@ class YTDLPDownloaderGUI(tk.Tk):
     def _post_extract_worker(self, outdir: Path):
         def log_cb(s: str):
             self.events.put(("post_extract_log", s))
+
         try:
             extract_all_mp4_audios(outdir, log_cb=log_cb)
         except Exception as e:
