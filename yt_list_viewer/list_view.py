@@ -52,12 +52,55 @@ def save_last_root(path: Path) -> None:
         pass
 
 
+# ------------------ タグファイルの読み書き ------------------ #
+def load_tags_file(dirpath: Path) -> Optional[str]:
+    """
+    各フォルダ内の tags.json からタグを読み込む。
+    形式: {"tags": ["tag1", "tag2", ...]}
+    表示用には "tag1, tag2" のような文字列で返す。
+    """
+    path = dirpath / "tags.json"
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        tags = data.get("tags")
+        if isinstance(tags, list):
+            return ", ".join(str(t) for t in tags)
+        if isinstance(tags, str):
+            return tags
+    except Exception:
+        pass
+    return None
+
+
+def save_tags_file(dirpath: Path, tags_str: str) -> None:
+    """
+    タグの文字列（カンマ区切り）を tags.json に保存する。
+    "tag1, tag2" -> {"tags": ["tag1", "tag2"]}
+    """
+    tags_list: List[str] = []
+    for t in tags_str.split(","):
+        t = t.strip()
+        if t:
+            tags_list.append(t)
+    data = {"tags": tags_list}
+    path = dirpath / "tags.json"
+    try:
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        raise e
+
+
 # ------------------ データ構造 ------------------ #
 @dataclass
 class VideoRow:
     folder: str
     has_video_info: bool
     title: Optional[str]
+    tags: Optional[str]          # 表示用タグ文字列 "tag1, tag2"
     video_id: Optional[str]
     duration: Optional[str]
     best_height: Optional[int]
@@ -174,11 +217,15 @@ def collect_rows(root: Path, on_progress=None) -> List[VideoRow]:
 
         thumb = pick_thumbnail(child)
 
+        # タグ読み込み
+        tags_str = load_tags_file(child)
+
         rows.append(
             VideoRow(
                 folder=child.name,
                 has_video_info=has_info,
                 title=title,
+                tags=tags_str,
                 video_id=video_id,
                 duration=duration,
                 best_height=best_height,
@@ -202,6 +249,7 @@ class VideoBrowserGUI(ttk.Frame):
     COLUMNS = (
         "folder",
         "title",
+        "tags",
         "video_id",
         "duration",
         "best_height",
@@ -215,6 +263,7 @@ class VideoBrowserGUI(ttk.Frame):
     SEARCHABLE_COLUMNS = (
         "folder",
         "title",
+        "tags",
         "video_id",
         "uploader",
         "upload_date",
@@ -226,6 +275,7 @@ class VideoBrowserGUI(ttk.Frame):
     SEARCH_LABEL_MAP = {
         "フォルダ": "folder",
         "タイトル": "title",
+        "タグ": "tags",
         "動画ID": "video_id",
         "投稿者": "uploader",
         "投稿日": "upload_date",
@@ -333,6 +383,7 @@ class VideoBrowserGUI(ttk.Frame):
         headings = {
             "folder": "フォルダ",
             "title": "タイトル",
+            "tags": "タグ",
             "video_id": "動画ID",
             "duration": "長さ",
             "best_height": "最大高さ(px)",
@@ -343,7 +394,8 @@ class VideoBrowserGUI(ttk.Frame):
         }
         widths = {
             "folder": 120,
-            "title": 300,
+            "title": 240,
+            "tags": 200,
             "video_id": 120,
             "duration": 80,
             "best_height": 110,
@@ -372,7 +424,18 @@ class VideoBrowserGUI(ttk.Frame):
         info_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=8)
 
         self.info_text = tk.Text(info_frame, height=6, wrap=tk.WORD)
-        self.info_text.pack(fill=tk.X, padx=8)
+        self.info_text.pack(fill=tk.X, padx=8, pady=(0, 4))
+
+        # タグ編集行
+        tag_frame = ttk.Frame(info_frame)
+        tag_frame.pack(fill=tk.X, padx=8, pady=(2, 4))
+        ttk.Label(tag_frame, text="タグ (カンマ区切り):").pack(side=tk.LEFT)
+        self.tag_var = tk.StringVar()
+        self.tag_entry = ttk.Entry(tag_frame, textvariable=self.tag_var, width=50)
+        self.tag_entry.pack(side=tk.LEFT, padx=4)
+        ttk.Button(tag_frame, text="タグ保存", command=self.save_tag_for_selected).pack(
+            side=tk.LEFT
+        )
 
         self.open_folder_btn = ttk.Button(
             detail, text="フォルダを開く",
@@ -389,6 +452,7 @@ class VideoBrowserGUI(ttk.Frame):
         return (
             r.folder,
             r.title or "",
+            r.tags or "",
             r.video_id or "",
             r.duration or "",
             r.best_height if r.best_height is not None else "",
@@ -535,6 +599,7 @@ class VideoBrowserGUI(ttk.Frame):
             (
                 f"フォルダ: {row.folder}\n"
                 f"タイトル: {row.title or ''}\n"
+                f"タグ: {row.tags or ''}\n"
                 f"動画ID: {row.video_id or ''}\n"
                 f"長さ: {row.duration or ''}\n"
                 f"最大高さ(px): {row.best_height or ''}\n"
@@ -546,6 +611,7 @@ class VideoBrowserGUI(ttk.Frame):
             ),
         )
 
+        self.tag_var.set(row.tags or "")
         self.show_thumbnail(row.thumbnail)
         self.open_folder_btn.configure(state=tk.NORMAL)
 
@@ -575,6 +641,32 @@ class VideoBrowserGUI(ttk.Frame):
         except Exception as e:
             self.thumb_label.configure(text=f"(表示失敗: {e})")
             self._thumb_cache.clear()
+
+    def save_tag_for_selected(self):
+        """現在選択中のフォルダにタグを保存する。"""
+        sel = self.tree.selection()
+        if not sel or not self.root_dir:
+            messagebox.showwarning("警告", "フォルダが選択されていません。")
+            return
+        folder_name = sel[0]
+        target_dir = self.root_dir / folder_name
+        tags_str = self.tag_var.get().strip()
+
+        try:
+            save_tags_file(target_dir, tags_str)
+        except Exception as e:
+            messagebox.showerror("保存失敗", f"タグの保存に失敗しました:\n{e}")
+            return
+
+        # rows / view_rows を更新
+        for r in self.rows:
+            if r.folder == folder_name:
+                r.tags = tags_str
+                break
+
+        # view_rows は rows の同一オブジェクトなのでそのままでOK
+        self.refresh_tree()
+        messagebox.showinfo("完了", "タグを保存しました。")
 
     def export_csv(self):
         if not self.rows:
@@ -654,7 +746,7 @@ def main():
         pass
 
     app = VideoBrowserGUI(root)
-    root.geometry("1200x760")
+    root.geometry("1250x780")
     root.mainloop()
 
 
