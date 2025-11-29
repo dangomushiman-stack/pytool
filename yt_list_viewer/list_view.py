@@ -87,11 +87,8 @@ def save_tags_file(dirpath: Path, tags_str: str) -> None:
             tags_list.append(t)
     data = {"tags": tags_list}
     path = dirpath / "tags.json"
-    try:
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        raise e
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 # ------------------ データ構造 ------------------ #
@@ -108,7 +105,7 @@ class VideoRow:
     uploader: Optional[str]
     upload_date: Optional[str]
     webpage_url: Optional[str]
-    info_timestamp: Optional[str]   # video_info.json の更新日時
+    info_timestamp: Optional[str]   # video_info.json の更新日時 "YYYY-MM-DD HH:MM:SS"
 
 
 # ------------------ ユーティリティ ------------------ #
@@ -474,7 +471,7 @@ class VideoBrowserGUI(ttk.Frame):
         target_label = self.search_target.get()
 
         if not query:
-            # 検索文字列が空なら全件表示
+            # 検索文字列が空なら全件表示（現在の self.rows の並びを尊重）
             self.view_rows = list(self.rows)
             self.refresh_tree()
             return
@@ -500,9 +497,15 @@ class VideoBrowserGUI(ttk.Frame):
         self.refresh_tree()
 
     def clear_filter(self):
+        """検索条件をクリアして、JSON更新日時の新しい順に戻す。"""
         self.search_var.set("")
         self.search_target.current(0)
-        self.apply_filter()
+
+        # クリア時も JSON更新日時で降順ソート（新しいものが上）
+        self.rows.sort(key=lambda r: r.info_timestamp or "", reverse=True)
+
+        self.view_rows = list(self.rows)
+        self.refresh_tree()
 
     # ---------- ソート ---------- #
     def sort_by_column(self, col: str):
@@ -571,6 +574,10 @@ class VideoBrowserGUI(ttk.Frame):
 
     def _finish_scan(self, root_path: Path, rows: List[VideoRow]):
         self.root_dir = root_path
+
+        # ★ 初回スキャン時：JSON更新日時で新しい順（降順）にソート
+        rows.sort(key=lambda r: r.info_timestamp or "", reverse=True)
+
         self.rows = rows
         self.view_rows = list(rows)
         self.refresh_tree()
@@ -664,7 +671,6 @@ class VideoBrowserGUI(ttk.Frame):
                 r.tags = tags_str
                 break
 
-        # view_rows は rows の同一オブジェクトなのでそのままでOK
         self.refresh_tree()
         messagebox.showinfo("完了", "タグを保存しました。")
 
