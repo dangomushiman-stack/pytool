@@ -1,8 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-yt-dlp ダウンローダー（Tkinter GUI） + 事後処理：MP4から音声のみ無再エンコード抽出
-- URL入力、保存先選択、ダウンロード
-- ダウンロード後、保存先フォルダの .mp4 を走査して音声のみを「-c copy」で抽出（コーデックに応じて拡張子/コンテナ調整）
+yt-dlp ダウンローダー（Tkinter GUI）
+ + 事後処理：
+   - 動画ファイル(mp4/webm/mkv)から音声のみ無再エンコード抽出
+   - ragtag の場合は「映像-only」「音声-only」を結合して mkv を追加生成
+
+対応想定サイト:
+  - YouTube
+  - bilibili（BV ID → bilibili_BVxxxx フォルダ）
+  - ragtag archive（?v=ID → ragtag_ID フォルダ）
+  - ニコニコ動画（smID → niconico_smXXXX フォルダ）
 
 前提:
   pip install yt-dlp
@@ -23,7 +30,7 @@ from urllib.parse import urlparse
 
 try:
     import yt_dlp
-except Exception as e:
+except Exception:
     raise SystemExit("yt-dlp がインポートできません。先に 'pip install yt-dlp' を実行してください")
 
 
@@ -50,7 +57,7 @@ def save_settings(data: dict):
         pass
 
 
-# ---------------------- 事後抽出ユーティリティ（ffmpeg系） ----------------------
+# ---------------------- ffmpeg/ffprobe ユーティリティ ----------------------
 def _run(cmd):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
@@ -75,6 +82,33 @@ def _probe_audio_codec(path: Path):
         return None
 
 
+def _probe_stream_types(path: Path) -> tuple[bool, bool]:
+    """
+    そのファイルに video / audio ストリームがあるかを
+    (has_video, has_audio) で返す
+    """
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_streams",
+        "-of", "json",
+        str(path),
+    ]
+    proc = _run(cmd)
+    has_v = False
+    has_a = False
+    try:
+        data = json.loads(proc.stdout)
+        for s in data.get("streams") or []:
+            codec_type = s.get("codec_type")
+            if codec_type == "video":
+                has_v = True
+            elif codec_type == "audio":
+                has_a = True
+    except Exception:
+        pass
+    return has_v, has_a
+
+
 @dataclass
 class _Plan:
     ext: str
@@ -89,7 +123,7 @@ _CODEC_PLAN = {
     "flac": _Plan(".flac", []),
     "ac3": _Plan(".ac3", []),
     "eac3": _Plan(".eac3", []),
-    "opus": _Plan(".mka", ["-f", "matroska"]),  # MP4にコピー不可のことが多い
+    "opus": _Plan(".mka", ["-f", "matroska"]),  # Opus は matroska にしておく
     "vorbis": _Plan(".ogg", ["-f", "ogg"]),
 }
 
@@ -112,15 +146,23 @@ def _extract_audio_copy(src: Path, dst: Path, plan: _Plan):
     return ok, proc.stderr
 
 
-def extract_all_mp4_audios(outdir: Path, log_cb=lambda s: None):
-    """outdir 直下の .mp4 を走査して音声を抽出（無再エンコード）。成功/失敗をログ"""
-    mp4s = sorted(outdir.glob("*.mp4"))
-    if not mp4s:
-        log_cb("（事後抽出）対象の .mp4 が見つかりませんでした。")
+def extract_all_audios(outdir: Path, log_cb=lambda s: None):
+    """
+    outdir 直下の mp4 / webm / mkv を走査して
+    音声トラックを無再エンコードで抽出。
+    """
+    targets: list[Path] = []
+    for ext in ("*.mp4", "*.webm", "*.mkv"):
+        targets.extend(outdir.glob(ext))
+    # 重複除去
+    targets = sorted(set(targets))
+
+    if not targets:
+        log_cb("（事後抽出）対象の動画ファイルが見つかりませんでした。")
         return
 
-    log_cb(f"（事後抽出）{len(mp4s)} 件の .mp4 から音声抽出を開始します。")
-    for src in mp4s:
+    log_cb(f"（事後抽出）{len(targets)} 件のファイルから音声抽出を開始します。")
+    for src in targets:
         log_cb(f"\n=== {src.name} ===")
         codec = _probe_audio_codec(src)
         if not codec:
@@ -130,22 +172,80 @@ def extract_all_mp4_audios(outdir: Path, log_cb=lambda s: None):
         if not plan:
             log_cb(f"未対応コーデックのためスキップ: {codec}")
             continue
+
         dst = src.with_suffix(plan.ext)
         i = 1
         while dst.exists():
             dst = src.with_name(f"{src.stem}_{i}{plan.ext}")
             i += 1
+
         ok, err = _extract_audio_copy(src, dst, plan)
         if ok:
             log_cb(f"✅ 出力: {dst.name}")
         else:
-            # 空ファイルなら掃除
             try:
                 if dst.exists() and dst.stat().st_size == 0:
                     dst.unlink()
             except Exception:
                 pass
             log_cb(f"❌ 失敗しました。詳細: {err}")
+
+
+def mux_ragtag_av(outdir: Path, log_cb=lambda s: None):
+    """
+    ragtag で落ちてきた「映像-only」「音声-only」のファイルから
+    映像＋音声の mkv ファイルを1つ作る（元ファイルは削除しない）
+    """
+    candidates: list[Path] = []
+    for ext in ("*.mp4", "*.webm", "*.mkv"):
+        candidates.extend(outdir.glob(ext))
+    if not candidates:
+        log_cb("（ragtag mux）対象ファイルが見つかりません。")
+        return
+
+    video_only: list[Path] = []
+    audio_only: list[Path] = []
+
+    for p in candidates:
+        has_v, has_a = _probe_stream_types(p)
+        if has_v and not has_a:
+            video_only.append(p)
+        elif has_a and not has_v:
+            audio_only.append(p)
+
+    if not video_only or not audio_only:
+        log_cb("（ragtag mux）映像-only／音声-only の組み合わせが見つかりません。")
+        return
+
+    # 一番サイズの大きいもの同士を選ぶ
+    v = max(video_only, key=lambda x: x.stat().st_size)
+    a = max(audio_only, key=lambda x: x.stat().st_size)
+
+    log_cb(f"（ragtag mux）映像: {v.name}")
+    log_cb(f"（ragtag mux）音声: {a.name}")
+
+    # 出力ファイル名：映像側の stem に _muxed を付けた mkv
+    dst = v.with_suffix("")  # 拡張子なし Path
+    dst = dst.with_name(dst.name + "_muxed.mkv")
+
+    i = 1
+    while dst.exists():
+        dst = dst.with_name(f"{dst.stem}_{i}.mkv")
+        i += 1
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(v),
+        "-i", str(a),
+        "-c", "copy",
+        str(dst),
+    ]
+    log_cb(f"（ragtag mux）ffmpeg 実行中: {dst.name}")
+    proc = _run(cmd)
+    if dst.exists() and dst.stat().st_size > 0 and proc.returncode == 0:
+        log_cb(f"✅ （ragtag mux）結合完了: {dst.name}")
+    else:
+        log_cb(f"❌ （ragtag mux）結合に失敗しました: {proc.stderr}")
 
 
 # ---------------------- URL 関連ユーティリティ ----------------------
@@ -163,23 +263,41 @@ def derive_savedir_from_url(url: str, base_outdir: str) -> str:
     URL から保存先サブフォルダ名を決める。
     - YouTube: 動画ID
     - bilibili: bilibili_BVxxxxxx
-    - その他: パスを利用
+    - ragtag: ragtag_動画ID（?v=以降）
+    - niconico: niconico_smXXXXXXX
+    - その他: パスを加工
     """
-    # YouTube
+    # --- YouTube ---
     vid = extract_youtube_id(url)
     if vid:
-        sub = vid
-        return os.path.join(base_outdir, sub)
+        return os.path.join(base_outdir, vid)
 
-    # bilibili（BV ID を抽出）
-    m = re.search(r"(BV[0-9A-Za-z]+)", url)
-    if m:
-        bv = m.group(1)  # BVxxxxxx
-        sub = f"bilibili_{bv}"
-        return os.path.join(base_outdir, sub)
-
-    # その他のサイト
     parsed = urlparse(url)
+
+    # --- bilibili（BV ID を抽出） ---
+    m_bv = re.search(r"(BV[0-9A-Za-z]+)", url)
+    if m_bv:
+        bv = m_bv.group(1)
+        return os.path.join(base_outdir, f"bilibili_{bv}")
+
+    # --- niconico（sm12345678 など）---
+    m_ni = re.search(r"(sm\d+)", url)
+    if m_ni:
+        smid = m_ni.group(1)
+        return os.path.join(base_outdir, f"niconico_{smid}")
+
+    # --- ragtag（?v=ID を抽出） ---
+    if "ragtag" in (parsed.netloc or ""):
+        m_v = re.search(r"[?&]v=([0-9A-Za-z_-]+)", url)
+        if m_v:
+            rag_id = m_v.group(1)
+            return os.path.join(base_outdir, f"ragtag_{rag_id}")
+        # v= が無い場合は最後のパス要素
+        path = parsed.path.strip("/")
+        last = path.split("/")[-1] if path else "episode"
+        return os.path.join(base_outdir, f"ragtag_{last}")
+
+    # --- その他サイト ---
     path = parsed.path.strip("/") or "download"
     sub = path.replace("/", "_")
     return os.path.join(base_outdir, sub)
@@ -189,7 +307,7 @@ def derive_savedir_from_url(url: str, base_outdir: str) -> str:
 class YTDLPDownloaderGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("yt-dlp Downloader (+ MP4音声抽出)")
+        self.title("yt-dlp Downloader (+ ragtag結合 & 音声抽出)")
         self.geometry("820x640")
         self.minsize(720, 520)
 
@@ -203,13 +321,12 @@ class YTDLPDownloaderGUI(tk.Tk):
         frm_top = ttk.Frame(self, padding=12)
         frm_top.pack(fill=tk.X)
 
-        ttk.Label(frm_top, text="URL（YouTube / bilibili など）").grid(
+        ttk.Label(frm_top, text="URL（YouTube / bilibili / ragtag / niconico など）").grid(
             row=0, column=0, sticky=tk.W
         )
         self.var_url = tk.StringVar()
         ent_url = ttk.Entry(frm_top, textvariable=self.var_url)
         ent_url.grid(row=0, column=1, columnspan=3, sticky=tk.EW, padx=(6, 0))
-        ent_url.insert(0, "")
         frm_top.columnconfigure(1, weight=1)
 
         ttk.Label(frm_top, text="保存先").grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
@@ -248,11 +365,11 @@ class YTDLPDownloaderGUI(tk.Tk):
             grp_sel, text="（動画選択時）別途 audio も保存", variable=self.var_extra_audio
         ).grid(row=1, column=1, sticky=tk.W, pady=(8, 0))
 
-        # 自動抽出のON/OFF（任意）
+        # 自動抽出のON/OFF
         self.var_post_extract = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             grp_sel,
-            text="ダウンロード後にMP4から音声を抽出（無再エンコード）",
+            text="ダウンロード後に ragtag結合 / 音声抽出 を実行",
             variable=self.var_post_extract,
         ).grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
 
@@ -282,7 +399,7 @@ class YTDLPDownloaderGUI(tk.Tk):
         self.txt.insert("end", "ログ出力をここに表示します...")
         self.txt.configure(state="disabled")
 
-        # UI ポーリング
+        # UI ポーリング開始
         self.after(100, self.process_events)
 
     # ---------- UI handlers ----------
@@ -292,8 +409,6 @@ class YTDLPDownloaderGUI(tk.Tk):
         )
         if path:
             self.var_outdir.set(path)
-
-            # 設定に保存
             self.settings = load_settings()
             self.settings["last_outdir"] = path
             save_settings(self.settings)
@@ -317,10 +432,10 @@ class YTDLPDownloaderGUI(tk.Tk):
         self.settings["last_outdir"] = outdir
         save_settings(self.settings)
 
-        # URL から保存フォルダを決定（YouTube / bilibili など共通）
+        # URL から保存フォルダを決定
         savedir = derive_savedir_from_url(url, outdir)
 
-        # 既存フォルダがある場合は確認ダイアログ
+        # 既存フォルダがある場合は確認
         if os.path.isdir(savedir):
             proceed = messagebox.askyesno(
                 "確認",
@@ -329,7 +444,6 @@ class YTDLPDownloaderGUI(tk.Tk):
                 "（既存ファイルが上書き／追記される可能性があります）",
             )
             if not proceed:
-                # ユーザーが中止を選択
                 return
 
         os.makedirs(savedir, exist_ok=True)
@@ -343,7 +457,7 @@ class YTDLPDownloaderGUI(tk.Tk):
         self.var_status.set("初期化中...")
         self._log(f"==== ダウンロード開始 ====\nURL: {url}\n保存先: {savedir}")
 
-        # メタ情報 JSON 保存
+        # メタ情報 JSON 保存（失敗しても致命的ではない）
         try:
             self._json_download(url, savedir)
         except Exception as e:
@@ -364,40 +478,49 @@ class YTDLPDownloaderGUI(tk.Tk):
         def progress_hook(d: dict):
             self.events.put(("progress", d))
 
+        parsed = urlparse(url)
+        is_ragtag = "ragtag" in (parsed.netloc or "")
+
+        # 共通オプション
         ydl_opts: dict = {
             "outtmpl": os.path.join(outdir, "%(title)s.%(ext)s"),
             "progress_hooks": [progress_hook],
             "cookiesfrombrowser": ("chrome",),
         }
 
+        # ---- リトライ強化設定 ----
+        ydl_opts.update({
+            "retries": 20,                # 通常のリトライ
+            "fragment_retries": 50,       # HLS/DASH の分割ファイル取得リトライ
+            "file_access_retries": 10,    # ファイル破損時の再試行
+            "extractor_retries": 10,      # メタ情報抽出の再試行
+            "retry_sleep": 2,             # リトライ間隔（秒）
+        })
+
+        # ragtag 以外はプレイリスト無視
+        if not is_ragtag:
+            ydl_opts["noplaylist"] = True
+
         if want_thumb:
             ydl_opts["writethumbnail"] = True
             ydl_opts.setdefault("postprocessors", []).append(
-                {
-                    "key": "FFmpegThumbnailsConvertor",
-                    "format": "jpg",
-                }
+                {"key": "FFmpegThumbnailsConvertor", "format": "jpg"}
             )
 
-        if content == "audio":
-            # 音声のみ（bestaudio）
-            ydl_opts.update(
-                {
-                    "format": "bestaudio/best",
-                }
-            )
-        elif content == "video_only":
-            ydl_opts.update(
-                {
-                    "format": "bv*",
-                }
-            )
-        else:  # video
-            ydl_opts.update(
-                {
-                    "format": "bv*+ba/b",
-                }
-            )
+        # --- ragtag / その他で format の決め方を分ける ---
+        if is_ragtag:
+            # ★ ragtag は CLI と同じく「デフォルトフォーマット & プレイリスト」
+            #    → format を指定しないで yt-dlp に任せる
+            pass
+        else:
+            # 通常サイト（YouTube, bilibili, niconico など）
+            if content == "audio":
+                ydl_opts["format"] = "bestaudio/best"
+            elif content == "video_only":
+                ydl_opts["format"] = "bestvideo/best"
+            else:
+                # 映像＋音声を別々に取りつつ、無理なら best
+                ydl_opts["format"] = "bestvideo*+bestaudio*/best"
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -408,6 +531,7 @@ class YTDLPDownloaderGUI(tk.Tk):
             self.events.put(("error", str(e)))
             return
 
+        # 動画（音声付き）＋「別途 audio も保存」がONなら、音声だけもう1本取る
         if content == "video" and extra_audio:
             self.events.put(("note", "動画とは別に音声トラックも取得中..."))
             audio_opts = {
@@ -417,6 +541,17 @@ class YTDLPDownloaderGUI(tk.Tk):
                 "verbose": False,
                 "cookiesfrombrowser": ("chrome",),
             }
+            # リトライ設定も同様に付与
+            audio_opts.update({
+                "retries": 20,
+                "fragment_retries": 50,
+                "file_access_retries": 10,
+                "extractor_retries": 10,
+                "retry_sleep": 2,
+            })
+            if not is_ragtag:
+                audio_opts["noplaylist"] = True
+
             try:
                 with yt_dlp.YoutubeDL(audio_opts) as ydl2:
                     ydl2.download([url])
@@ -424,7 +559,7 @@ class YTDLPDownloaderGUI(tk.Tk):
                 self.events.put(("error", f"追加オーディオ作成失敗: {e}"))
 
         # ダウンロード完了
-        self.events.put(("done", {"outdir": outdir}))
+        self.events.put(("done", {"outdir": outdir, "is_ragtag": is_ragtag}))
 
     # ---------- UI event processing ----------
     def process_events(self):
@@ -444,7 +579,7 @@ class YTDLPDownloaderGUI(tk.Tk):
                 elif kind == "post_extract_log":
                     self._log(str(payload))
                 elif kind == "post_extract_done":
-                    self._log("（事後抽出）完了しました。")
+                    self._log("（事後処理）完了しました。")
                     self.var_status.set("完了しました")
         except queue.Empty:
             pass
@@ -478,6 +613,7 @@ class YTDLPDownloaderGUI(tk.Tk):
             "writesubtitles": True,
             "subtitleslangs": ["ja", "en"],
             "cookiesfrombrowser": ("chrome",),
+            "noplaylist": True,
         }
         os.makedirs(path, exist_ok=True)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -496,12 +632,14 @@ class YTDLPDownloaderGUI(tk.Tk):
         self.pb.configure(value=100)
         self.btn_start.configure(state="normal")
         self.var_status.set("ダウンロード完了")
-        # ここで事後抽出を開始（別スレッド）
         outdir = payload.get("outdir")
+        is_ragtag = payload.get("is_ragtag", False)
         if self.var_post_extract.get() and outdir:
-            self._log("（事後抽出）MP4から音声抽出を開始します...")
+            self._log("（事後処理）ragtag結合 / 音声抽出 を開始します...")
             threading.Thread(
-                target=self._post_extract_worker, args=(Path(outdir),), daemon=True
+                target=self._post_extract_worker,
+                args=(Path(outdir), bool(is_ragtag)),
+                daemon=True,
             ).start()
 
     def _on_error(self, msg: str):
@@ -515,15 +653,20 @@ class YTDLPDownloaderGUI(tk.Tk):
         self.txt.see("end")
         self.txt.configure(state="disabled")
 
-    # 事後抽出スレッド
-    def _post_extract_worker(self, outdir: Path):
+    # 事後処理スレッド
+    def _post_extract_worker(self, outdir: Path, is_ragtag: bool):
         def log_cb(s: str):
             self.events.put(("post_extract_log", s))
 
         try:
-            extract_all_mp4_audios(outdir, log_cb=log_cb)
+            # 1) ragtag ならまず映像＋音声の結合を試みる
+            if is_ragtag:
+                mux_ragtag_av(outdir, log_cb=log_cb)
+
+            # 2) そのあと共通の「音声抽出」
+            extract_all_audios(outdir, log_cb=log_cb)
         except Exception as e:
-            log_cb(f"（事後抽出）エラー: {e}")
+            log_cb(f"（事後処理）エラー: {e}")
         finally:
             self.events.put(("post_extract_done", {}))
 
