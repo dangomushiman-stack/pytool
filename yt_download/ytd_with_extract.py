@@ -1,19 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-yt-dlp ダウンローダー（Tkinter GUI）
- + 事後処理：
-   - 動画ファイル(mp4/webm/mkv)から音声のみ無再エンコード抽出
-   - ragtag の場合は「映像-only」「音声-only」を結合して mkv を追加生成
-
-対応想定サイト:
-  - YouTube
-  - bilibili（BV ID → bilibili_BVxxxx フォルダ）
-  - ragtag archive（?v=ID → ragtag_ID フォルダ）
-  - ニコニコ動画（smID → niconico_smXXXX フォルダ）
-
-前提:
-  pip install yt-dlp
-  ffmpeg / ffprobe が PATH に通っていること
+yt-dlp GUIラッパー（CLI直接実行版 + 標準出力Verbose）
+ 
+機能:
+  - 複数URLの一括ダウンロード
+  - 事前フォルダ存在チェック
+  - CLI (yt-dlp) 直接呼び出しによる安定化
+  - コンソールへの進行状況出力 (print)
 """
 
 import os
@@ -24,19 +17,13 @@ from tkinter import ttk, filedialog, messagebox
 import re
 import json
 import subprocess
+import datetime
 from pathlib import Path
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-try:
-    import yt_dlp
-except Exception:
-    raise SystemExit("yt-dlp がインポートできません。先に 'pip install yt-dlp' を実行してください")
-
-
 # ---------------------- 設定ファイルユーティリティ ----------------------
 SETTINGS_FILE = "settings.json"
-
 
 def load_settings():
     if not os.path.exists(SETTINGS_FILE):
@@ -47,23 +34,30 @@ def load_settings():
     except Exception:
         return {}
 
-
 def save_settings(data: dict):
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
-        # 設定保存に失敗してもアプリ自体は続行する
         pass
 
+# ---------------------- ログ出力ヘルパー ----------------------
+def console_log(msg):
+    """標準出力に時刻付きで表示"""
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"[{now}] {msg}")
 
 # ---------------------- ffmpeg/ffprobe ユーティリティ ----------------------
 def _run(cmd):
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
+    # Windowsでウィンドウを出さないための設定
+    startupinfo = None
+    if os.name == 'nt':
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', startupinfo=startupinfo)
 
 def _probe_audio_codec(path: Path):
-    """先頭の音声ストリームの codec_name を返す。なければ None"""
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "a:0",
@@ -81,12 +75,7 @@ def _probe_audio_codec(path: Path):
     except Exception:
         return None
 
-
 def _probe_stream_types(path: Path) -> tuple[bool, bool]:
-    """
-    そのファイルに video / audio ストリームがあるかを
-    (has_video, has_audio) で返す
-    """
     cmd = [
         "ffprobe", "-v", "error",
         "-show_streams",
@@ -108,14 +97,11 @@ def _probe_stream_types(path: Path) -> tuple[bool, bool]:
         pass
     return has_v, has_a
 
-
 @dataclass
 class _Plan:
     ext: str
     extra_args: list
 
-
-# コーデック→出力先定義（無再エンコード）
 _CODEC_PLAN = {
     "aac": _Plan(".m4a", []),
     "alac": _Plan(".m4a", []),
@@ -123,10 +109,9 @@ _CODEC_PLAN = {
     "flac": _Plan(".flac", []),
     "ac3": _Plan(".ac3", []),
     "eac3": _Plan(".eac3", []),
-    "opus": _Plan(".mka", ["-f", "matroska"]),  # Opus は matroska にしておく
+    "opus": _Plan(".mka", ["-f", "matroska"]),
     "vorbis": _Plan(".ogg", ["-f", "ogg"]),
 }
-
 
 def _plan_for(codec: str | None):
     if not codec:
@@ -135,42 +120,30 @@ def _plan_for(codec: str | None):
         return _Plan(".wav", ["-f", "wav"])
     return _CODEC_PLAN.get(codec)
 
-
 def _extract_audio_copy(src: Path, dst: Path, plan: _Plan):
-    """ffmpeg -vn -acodec copy + extra_args"""
-    cmd = ["ffmpeg", "-y", "-i", str(src), "-vn", "-acodec", "copy"] + plan.extra_args + [
-        str(dst)
-    ]
+    cmd = ["ffmpeg", "-y", "-i", str(src), "-vn", "-acodec", "copy"] + plan.extra_args + [str(dst)]
     proc = _run(cmd)
     ok = proc.returncode == 0 and dst.exists() and dst.stat().st_size > 0
     return ok, proc.stderr
 
-
 def extract_all_audios(outdir: Path, log_cb=lambda s: None):
-    """
-    outdir 直下の mp4 / webm / mkv を走査して
-    音声トラックを無再エンコードで抽出。
-    """
+    console_log(f"  [FFmpeg] 音声抽出処理を開始: {outdir}")
     targets: list[Path] = []
     for ext in ("*.mp4", "*.webm", "*.mkv"):
         targets.extend(outdir.glob(ext))
-    # 重複除去
     targets = sorted(set(targets))
 
     if not targets:
-        log_cb("（事後抽出）対象の動画ファイルが見つかりませんでした。")
+        log_cb("対象ファイルなし")
         return
 
-    log_cb(f"（事後抽出）{len(targets)} 件のファイルから音声抽出を開始します。")
     for src in targets:
-        log_cb(f"\n=== {src.name} ===")
         codec = _probe_audio_codec(src)
         if not codec:
-            log_cb("音声ストリームが見つからないか解析に失敗しました。スキップ。")
             continue
         plan = _plan_for(codec)
         if not plan:
-            log_cb(f"未対応コーデックのためスキップ: {codec}")
+            console_log(f"  [FFmpeg] Skip (未対応コーデック): {codec} in {src.name}")
             continue
 
         dst = src.with_suffix(plan.ext)
@@ -179,28 +152,20 @@ def extract_all_audios(outdir: Path, log_cb=lambda s: None):
             dst = src.with_name(f"{src.stem}_{i}{plan.ext}")
             i += 1
 
+        console_log(f"    -> Extracting: {src.name} -> {dst.name}")
         ok, err = _extract_audio_copy(src, dst, plan)
         if ok:
-            log_cb(f"✅ 出力: {dst.name}")
+            log_cb(f"✅ 音声出力: {dst.name}")
         else:
-            try:
-                if dst.exists() and dst.stat().st_size == 0:
-                    dst.unlink()
-            except Exception:
-                pass
-            log_cb(f"❌ 失敗しました。詳細: {err}")
-
+            console_log(f"    -> Failed: {err}")
+            log_cb(f"❌ 失敗: {dst.name}")
 
 def mux_ragtag_av(outdir: Path, log_cb=lambda s: None):
-    """
-    ragtag で落ちてきた「映像-only」「音声-only」のファイルから
-    映像＋音声の mkv ファイルを1つ作る（元ファイルは削除しない）
-    """
+    console_log(f"  [FFmpeg] ragtag結合処理を確認: {outdir}")
     candidates: list[Path] = []
     for ext in ("*.mp4", "*.webm", "*.mkv"):
         candidates.extend(outdir.glob(ext))
     if not candidates:
-        log_cb("（ragtag mux）対象ファイルが見つかりません。")
         return
 
     video_only: list[Path] = []
@@ -214,18 +179,16 @@ def mux_ragtag_av(outdir: Path, log_cb=lambda s: None):
             audio_only.append(p)
 
     if not video_only or not audio_only:
-        log_cb("（ragtag mux）映像-only／音声-only の組み合わせが見つかりません。")
+        console_log("  [FFmpeg] 結合対象なし (映像のみ/音声のみ のペアが見つかりません)")
         return
 
-    # 一番サイズの大きいもの同士を選ぶ
     v = max(video_only, key=lambda x: x.stat().st_size)
     a = max(audio_only, key=lambda x: x.stat().st_size)
 
-    log_cb(f"（ragtag mux）映像: {v.name}")
-    log_cb(f"（ragtag mux）音声: {a.name}")
+    console_log(f"  [FFmpeg] Muxing: {v.name} + {a.name}")
+    log_cb(f"結合中: {v.name} + {a.name}")
 
-    # 出力ファイル名：映像側の stem に _muxed を付けた mkv
-    dst = v.with_suffix("")  # 拡張子なし Path
+    dst = v.with_suffix("")
     dst = dst.with_name(dst.name + "_muxed.mkv")
 
     i = 1
@@ -240,436 +203,424 @@ def mux_ragtag_av(outdir: Path, log_cb=lambda s: None):
         "-c", "copy",
         str(dst),
     ]
-    log_cb(f"（ragtag mux）ffmpeg 実行中: {dst.name}")
     proc = _run(cmd)
     if dst.exists() and dst.stat().st_size > 0 and proc.returncode == 0:
-        log_cb(f"✅ （ragtag mux）結合完了: {dst.name}")
+        console_log(f"    -> Mux Success: {dst.name}")
+        log_cb(f"✅ 結合完了: {dst.name}")
     else:
-        log_cb(f"❌ （ragtag mux）結合に失敗しました: {proc.stderr}")
+        console_log(f"    -> Mux Failed: {proc.stderr}")
+        log_cb(f"❌ 結合失敗")
 
 
 # ---------------------- URL 関連ユーティリティ ----------------------
 def extract_youtube_id(url: str) -> str | None:
-    """YouTube URLから動画IDを抽出（該当しないURLなら None）"""
     pattern = re.compile(
         r"(?:https?://)?(?:www\.|m\.)?(?:youtube\.com/(?:watch\?v=|embed/|v/|shorts/)|youtu\.be/)([A-Za-z0-9_-]{11})"
     )
     match = pattern.search(url)
     return match.group(1) if match else None
 
-
 def derive_savedir_from_url(url: str, base_outdir: str) -> str:
-    """
-    URL から保存先サブフォルダ名を決める。
-    - YouTube: 動画ID
-    - bilibili: bilibili_BVxxxxxx
-    - ragtag: ragtag_動画ID（?v=以降）
-    - niconico: niconico_smXXXXXXX
-    - その他: パスを加工
-    """
-    # --- YouTube ---
     vid = extract_youtube_id(url)
     if vid:
         return os.path.join(base_outdir, vid)
-
     parsed = urlparse(url)
-
-    # --- bilibili（BV ID を抽出） ---
     m_bv = re.search(r"(BV[0-9A-Za-z]+)", url)
     if m_bv:
         bv = m_bv.group(1)
         return os.path.join(base_outdir, f"bilibili_{bv}")
-
-    # --- niconico（sm12345678 など）---
     m_ni = re.search(r"(sm\d+)", url)
     if m_ni:
         smid = m_ni.group(1)
         return os.path.join(base_outdir, f"niconico_{smid}")
-
-    # --- ragtag（?v=ID を抽出） ---
     if "ragtag" in (parsed.netloc or ""):
         m_v = re.search(r"[?&]v=([0-9A-Za-z_-]+)", url)
         if m_v:
             rag_id = m_v.group(1)
             return os.path.join(base_outdir, f"ragtag_{rag_id}")
-        # v= が無い場合は最後のパス要素
         path = parsed.path.strip("/")
         last = path.split("/")[-1] if path else "episode"
         return os.path.join(base_outdir, f"ragtag_{last}")
-
-    # --- その他サイト ---
     path = parsed.path.strip("/") or "download"
     sub = path.replace("/", "_")
     return os.path.join(base_outdir, sub)
-
 
 # ---------------------- GUI 本体 ----------------------
 class YTDLPDownloaderGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("yt-dlp Downloader (+ ragtag結合 & 音声抽出)")
-        self.geometry("820x640")
+        self.title("yt-dlp Downloader (Console Verbose)")
+        self.geometry("820x680")
         self.minsize(720, 520)
 
-        self.events = queue.Queue()  # ワーカー→UI
+        self.events = queue.Queue()
         self.worker: threading.Thread | None = None
+        
+        self.url_queue: list[str] = []
+        self.total_tasks = 0
+        self.current_task_idx = 0
 
-        # 設定読み込み
         self.settings = load_settings()
 
-        # --- 上段：URL 入力と保存先 ---
+        # --- UI構成 ---
         frm_top = ttk.Frame(self, padding=12)
         frm_top.pack(fill=tk.X)
+        ttk.Label(frm_top, text="URL（複数可：1行に1つずつ入力してください）").pack(anchor=tk.W)
+        frm_text = ttk.Frame(frm_top)
+        frm_text.pack(fill=tk.X, pady=(4, 0))
+        self.txt_url = tk.Text(frm_text, height=5)
+        self.txt_url.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        scr = ttk.Scrollbar(frm_text, command=self.txt_url.yview)
+        scr.pack(side=tk.RIGHT, fill=tk.Y)
+        self.txt_url.configure(yscrollcommand=scr.set)
 
-        ttk.Label(frm_top, text="URL（YouTube / bilibili / ragtag / niconico など）").grid(
-            row=0, column=0, sticky=tk.W
-        )
-        self.var_url = tk.StringVar()
-        ent_url = ttk.Entry(frm_top, textvariable=self.var_url)
-        ent_url.grid(row=0, column=1, columnspan=3, sticky=tk.EW, padx=(6, 0))
-        frm_top.columnconfigure(1, weight=1)
-
-        ttk.Label(frm_top, text="保存先").grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
-
+        frm_dir = ttk.Frame(self, padding=(12, 0))
+        frm_dir.pack(fill=tk.X)
+        ttk.Label(frm_dir, text="保存先（親フォルダ）").pack(side=tk.LEFT)
         default_outdir = self.settings.get("last_outdir", os.getcwd())
         self.var_outdir = tk.StringVar(value=default_outdir)
+        ent_out = ttk.Entry(frm_dir, textvariable=self.var_outdir)
+        ent_out.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Button(frm_dir, text="参照...", command=self.browse_outdir).pack(side=tk.LEFT)
 
-        ent_out = ttk.Entry(frm_top, textvariable=self.var_outdir)
-        ent_out.grid(row=1, column=1, sticky=tk.EW, padx=(6, 4), pady=(8, 0))
-        ttk.Button(frm_top, text="参照...", command=self.browse_outdir).grid(
-            row=1, column=2, sticky=tk.E, pady=(8, 0)
-        )
-
-        # --- ダウンロード内容の選択 ---
-        grp_sel = ttk.LabelFrame(self, text="ダウンロード内容", padding=12)
-        grp_sel.pack(fill=tk.X, padx=12, pady=(4, 0))
-
-        self.var_content = tk.StringVar(value="video")  # video / audio / video_only
-        ttk.Radiobutton(
-            grp_sel, text="動画（音声付き）", value="video", variable=self.var_content
-        ).grid(row=0, column=0, sticky=tk.W)
-        ttk.Radiobutton(
-            grp_sel, text="音声のみ（bestaudio）", value="audio", variable=self.var_content
-        ).grid(row=0, column=1, sticky=tk.W, padx=(16, 0))
-        ttk.Radiobutton(
-            grp_sel, text="動画のみ（無音）", value="video_only", variable=self.var_content
-        ).grid(row=0, column=2, sticky=tk.W, padx=(16, 0))
-
+        grp_sel = ttk.LabelFrame(self, text="設定 (CLI引数)", padding=12)
+        grp_sel.pack(fill=tk.X, padx=12, pady=8)
+        self.var_content = tk.StringVar(value="video")
+        frm_radios = ttk.Frame(grp_sel)
+        frm_radios.pack(fill=tk.X, anchor=tk.W)
+        ttk.Radiobutton(frm_radios, text="動画（音声付き）", value="video", variable=self.var_content).pack(side=tk.LEFT)
+        ttk.Radiobutton(frm_radios, text="音声のみ", value="audio", variable=self.var_content).pack(side=tk.LEFT, padx=16)
+        ttk.Radiobutton(frm_radios, text="動画のみ", value="video_only", variable=self.var_content).pack(side=tk.LEFT, padx=16)
+        
+        frm_checks = ttk.Frame(grp_sel)
+        frm_checks.pack(fill=tk.X, anchor=tk.W, pady=(8,0))
         self.var_thumb = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            grp_sel, text="サムネイルも保存（.jpg 変換）", variable=self.var_thumb
-        ).grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
-
+        ttk.Checkbutton(frm_checks, text="サムネイル保存", variable=self.var_thumb).pack(side=tk.LEFT)
         self.var_extra_audio = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            grp_sel, text="（動画選択時）別途 audio も保存", variable=self.var_extra_audio
-        ).grid(row=1, column=1, sticky=tk.W, pady=(8, 0))
-
-        # 自動抽出のON/OFF
+        ttk.Checkbutton(frm_checks, text="（動画時）Audio別途保存", variable=self.var_extra_audio).pack(side=tk.LEFT, padx=16)
         self.var_post_extract = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            grp_sel,
-            text="ダウンロード後に ragtag結合 / 音声抽出 を実行",
-            variable=self.var_post_extract,
-        ).grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+        ttk.Checkbutton(frm_checks, text="完了後に結合/音声抽出を実行", variable=self.var_post_extract).pack(side=tk.LEFT, padx=16)
 
-        # --- 実行ボタン ---
         frm_btn = ttk.Frame(self, padding=(12, 0))
         frm_btn.pack(fill=tk.X)
-        self.btn_start = ttk.Button(frm_btn, text="ダウンロード開始", command=self.on_start)
+        self.btn_start = ttk.Button(frm_btn, text="一括ダウンロード開始", command=self.on_start)
         self.btn_start.pack(side=tk.RIGHT)
 
-        # --- 進捗 ---
         frm_prog = ttk.Frame(self, padding=12)
         frm_prog.pack(fill=tk.X)
-        self.pb = ttk.Progressbar(
-            frm_prog, length=300, mode="determinate", maximum=100
-        )
+        self.pb = ttk.Progressbar(frm_prog, length=300, mode="determinate", maximum=100)
         self.pb.pack(fill=tk.X)
         self.var_status = tk.StringVar(value="待機中")
-        ttk.Label(frm_prog, textvariable=self.var_status).pack(
-            anchor=tk.W, pady=(6, 0)
-        )
+        ttk.Label(frm_prog, textvariable=self.var_status).pack(anchor=tk.W, pady=(6, 0))
 
-        # --- ログ ---
         frm_log = ttk.Frame(self, padding=(12, 0))
         frm_log.pack(fill=tk.BOTH, expand=True)
-        self.txt = tk.Text(frm_log, height=16, wrap="word")
-        self.txt.pack(fill=tk.BOTH, expand=True)
-        self.txt.insert("end", "ログ出力をここに表示します...")
-        self.txt.configure(state="disabled")
+        self.txt_log = tk.Text(frm_log, height=12, wrap="word")
+        self.txt_log.pack(fill=tk.BOTH, expand=True)
+        self.txt_log.insert("end", "コンソール（標準出力）にも詳細な進捗を表示します。\n")
+        self.txt_log.configure(state="disabled")
 
-        # UI ポーリング開始
         self.after(100, self.process_events)
 
-    # ---------- UI handlers ----------
     def browse_outdir(self):
-        path = filedialog.askdirectory(
-            initialdir=self.var_outdir.get() or os.path.expanduser("~")
-        )
+        path = filedialog.askdirectory(initialdir=self.var_outdir.get() or os.path.expanduser("~"))
         if path:
             self.var_outdir.set(path)
-            self.settings = load_settings()
             self.settings["last_outdir"] = path
             save_settings(self.settings)
 
     def on_start(self):
-        url = self.var_url.get().strip()
-        outdir = self.var_outdir.get().strip()
+        raw_text = self.txt_url.get("1.0", "end").strip()
+        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+
+        if not lines:
+            messagebox.showwarning("入力不足", "URL を入力してください")
+            return
+        outdir_base = self.var_outdir.get().strip()
+        if not outdir_base:
+            messagebox.showwarning("入力不足", "保存先フォルダを指定してください")
+            return
+        
+        self.settings["last_outdir"] = outdir_base
+        save_settings(self.settings)
+
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("実行中", "現在処理中です")
+            return
+
+        # 事前チェック
+        console_log("==== 事前チェック開始 ====")
+        existing_list = []
+        for i, url in enumerate(lines, 1):
+            savedir = derive_savedir_from_url(url, outdir_base)
+            if os.path.isdir(savedir):
+                existing_list.append(savedir)
+                console_log(f"  [WARN] 既存フォルダ検知: {os.path.basename(savedir)}")
+            else:
+                console_log(f"  [OK] 新規作成予定: {os.path.basename(savedir)}")
+
+        if existing_list:
+            count = len(existing_list)
+            display_list = existing_list[:10]
+            msg_txt = "\n".join([os.path.basename(p) for p in display_list])
+            if count > 10:
+                msg_txt += f"\n... 他 {count - 10} 件"
+            proceed = messagebox.askyesno(
+                "確認", f"{count} 件のフォルダが既に存在します。続行しますか？\n\n{msg_txt}"
+            )
+            if not proceed:
+                console_log("ユーザーキャンセルにより中止")
+                return
+
+        self.url_queue = lines
+        self.total_tasks = len(lines)
+        self.current_task_idx = 0
+        self.btn_start.configure(state="disabled")
+        
+        console_log(f"==== 一括ダウンロード開始 (全 {self.total_tasks} 件) ====")
+        self.start_next_download()
+
+    def start_next_download(self):
+        if not self.url_queue:
+            console_log("==== 全タスク完了 ====")
+            self.var_status.set("全タスク完了")
+            self.pb.configure(value=100)
+            self.btn_start.configure(state="normal")
+            return
+
+        url = self.url_queue.pop(0)
+        self.current_task_idx += 1
+        outdir_base = self.var_outdir.get().strip()
+        savedir = derive_savedir_from_url(url, outdir_base)
+        os.makedirs(savedir, exist_ok=True)
+
+        self.pb.configure(value=0)
+        self.var_status.set(f"[{self.current_task_idx}/{self.total_tasks}] 初期化中...")
+        
+        console_log(f"\n--- [Task {self.current_task_idx}/{self.total_tasks}] Start ---")
+        console_log(f"  URL: {url}")
+        console_log(f"  Dir: {savedir}")
+
         content = self.var_content.get()
         want_thumb = self.var_thumb.get()
         extra_audio = self.var_extra_audio.get()
 
-        if not url:
-            messagebox.showwarning("入力不足", "URL を入力してください")
-            return
-        if not outdir:
-            messagebox.showwarning("入力不足", "保存先フォルダを指定してください")
-            return
+        # JSON取得（CLI実行）
+        threading.Thread(target=self._run_json_dump, args=(url, savedir), daemon=True).start()
 
-        # 保存先を設定ファイルに記録
-        self.settings = load_settings()
-        self.settings["last_outdir"] = outdir
-        save_settings(self.settings)
-
-        # URL から保存フォルダを決定
-        savedir = derive_savedir_from_url(url, outdir)
-
-        # 既存フォルダがある場合は確認
-        if os.path.isdir(savedir):
-            proceed = messagebox.askyesno(
-                "確認",
-                f"保存先「{savedir}」は既に存在します。\n"
-                "このままダウンロードを続行しますか？\n"
-                "（既存ファイルが上書き／追記される可能性があります）",
-            )
-            if not proceed:
-                return
-
-        os.makedirs(savedir, exist_ok=True)
-
-        if self.worker and self.worker.is_alive():
-            messagebox.showinfo("実行中", "前のダウンロードがまだ実行中です")
-            return
-
-        self.btn_start.configure(state="disabled")
-        self.pb.configure(value=0)
-        self.var_status.set("初期化中...")
-        self._log(f"==== ダウンロード開始 ====\nURL: {url}\n保存先: {savedir}")
-
-        # メタ情報 JSON 保存（失敗しても致命的ではない）
-        try:
-            self._json_download(url, savedir)
-        except Exception as e:
-            self._log(f"メタ情報取得に失敗しました: {e}")
-
-        # ダウンロードワーカースレッド起動
+        # ダウンロードワーカー起動
         self.worker = threading.Thread(
-            target=self.download_worker,
+            target=self.download_worker_cli,
             args=(url, savedir, content, want_thumb, extra_audio),
             daemon=True,
         )
         self.worker.start()
 
-    # ---------- Worker & yt-dlp ----------
-    def download_worker(
-        self, url: str, outdir: str, content: str, want_thumb: bool, extra_audio: bool
-    ):
-        def progress_hook(d: dict):
-            self.events.put(("progress", d))
+    # ---------- Worker (CLI Call) ----------
+    def _run_json_dump(self, url, savedir):
+        """メタデータを --dump-json で取得して保存"""
+        console_log("  [Step] メタデータ(JSON)取得中...")
+        cmd = ["yt-dlp", "--dump-json", "--skip-download", "--cookies-from-browser", "chrome", url]
+        try:
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', startupinfo=startupinfo)
+            if proc.returncode == 0:
+                data = json.loads(proc.stdout)
+                with open(os.path.join(savedir, "video_info.json"), "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                self.events.put(("info", {"title": data.get("title", "")}))
+                console_log("  [Step] JSON保存完了")
+            else:
+                console_log("  [Step] JSON取得失敗 (Skip)")
+        except Exception as e:
+            console_log(f"  [Error] JSON取得例外: {e}")
 
+    def download_worker_cli(self, url, outdir, content, want_thumb, extra_audio):
         parsed = urlparse(url)
         is_ragtag = "ragtag" in (parsed.netloc or "")
 
-        # 共通オプション
-        ydl_opts: dict = {
-            "outtmpl": os.path.join(outdir, "%(title)s.%(ext)s"),
-            "progress_hooks": [progress_hook],
-            "cookiesfrombrowser": ("chrome",),
-        }
+        console_log("  [Step] メインダウンロード開始 (yt-dlp)...")
 
-        # ---- リトライ強化設定 ----
-        ydl_opts.update({
-            "retries": 20,                # 通常のリトライ
-            "fragment_retries": 50,       # HLS/DASH の分割ファイル取得リトライ
-            "file_access_retries": 10,    # ファイル破損時の再試行
-            "extractor_retries": 10,      # メタ情報抽出の再試行
-            "retry_sleep": 2,             # リトライ間隔（秒）
-        })
+        # ベースコマンド
+        cmd = ["yt-dlp"]
+        cmd.extend(["-o", os.path.join(outdir, "%(title)s.%(ext)s")])
+        cmd.extend([
+            "--cookies-from-browser", "chrome",
+            "--retries", "20",
+            "--fragment-retries", "50",
+            "--file-access-retries", "10",
+            "--extractor-retries", "10",
+            "--retry-sleep", "2",
+            "--newline",
+            "--no-colors"
+        ])
 
-        # ragtag 以外はプレイリスト無視
         if not is_ragtag:
-            ydl_opts["noplaylist"] = True
+            cmd.append("--no-playlist")
 
         if want_thumb:
-            ydl_opts["writethumbnail"] = True
-            ydl_opts.setdefault("postprocessors", []).append(
-                {"key": "FFmpegThumbnailsConvertor", "format": "jpg"}
-            )
+            cmd.append("--write-thumbnail")
+            cmd.extend(["--convert-thumbnails", "jpg"])
 
-        # --- ragtag / その他で format の決め方を分ける ---
         if is_ragtag:
-            # ★ ragtag は CLI と同じく「デフォルトフォーマット & プレイリスト」
-            #    → format を指定しないで yt-dlp に任せる
-            pass
+            pass 
         else:
-            # 通常サイト（YouTube, bilibili, niconico など）
             if content == "audio":
-                ydl_opts["format"] = "bestaudio/best"
+                cmd.extend(["-f", "bestaudio/best"])
             elif content == "video_only":
-                ydl_opts["format"] = "bestvideo/best"
+                cmd.extend(["-f", "bestvideo/best"])
             else:
-                # 映像＋音声を別々に取りつつ、無理なら best
-                ydl_opts["format"] = "bestvideo*+bestaudio*/best"
+                cmd.extend(["-f", "bestvideo*+bestaudio*/best"])
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                title = info.get("title") or "(no title)"
-                self.events.put(("info", {"title": title}))
-        except Exception as e:
-            self.events.put(("error", str(e)))
+        cmd.append(url)
+
+        # 実行とログ解析
+        success = self._run_and_monitor(cmd)
+
+        if not success:
+            console_log("  [Error] メインダウンロード失敗")
+            self.events.put(("error", "yt-dlp コマンドがエラー終了しました"))
+            self.events.put(("done", {"outdir": outdir, "is_ragtag": is_ragtag, "error": True}))
             return
 
-        # 動画（音声付き）＋「別途 audio も保存」がONなら、音声だけもう1本取る
+        console_log("  [Step] メインダウンロード完了")
+
+        # 追加オーディオ（動画モード時）
         if content == "video" and extra_audio:
-            self.events.put(("note", "動画とは別に音声トラックも取得中..."))
-            audio_opts = {
-                "outtmpl": os.path.join(outdir, "%(title)s [audio].%(ext)s"),
-                "progress_hooks": [progress_hook],
-                "format": "bestaudio[protocol!=m3u8][vcodec=none]/bestaudio[vcodec=none]",
-                "verbose": False,
-                "cookiesfrombrowser": ("chrome",),
-            }
-            # リトライ設定も同様に付与
-            audio_opts.update({
-                "retries": 20,
-                "fragment_retries": 50,
-                "file_access_retries": 10,
-                "extractor_retries": 10,
-                "retry_sleep": 2,
-            })
+            console_log("  [Step] 追加オーディオトラック取得開始...")
+            self.events.put(("note", "別途音声トラック取得中(CLI)..."))
+            cmd2 = ["yt-dlp"]
+            cmd2.extend(["-o", os.path.join(outdir, "%(title)s [audio].%(ext)s")])
+            cmd2.extend(["--cookies-from-browser", "chrome", "--newline", "--no-colors"])
+            cmd2.extend(["-f", "bestaudio[protocol!=m3u8][vcodec=none]/bestaudio[vcodec=none]"])
             if not is_ragtag:
-                audio_opts["noplaylist"] = True
+                cmd2.append("--no-playlist")
+            cmd2.append(url)
+            self._run_and_monitor(cmd2)
+            console_log("  [Step] 追加オーディオ完了")
 
-            try:
-                with yt_dlp.YoutubeDL(audio_opts) as ydl2:
-                    ydl2.download([url])
-            except Exception as e:
-                self.events.put(("error", f"追加オーディオ作成失敗: {e}"))
+        self.events.put(("done", {"outdir": outdir, "is_ragtag": is_ragtag, "error": False}))
 
-        # ダウンロード完了
-        self.events.put(("done", {"outdir": outdir, "is_ragtag": is_ragtag}))
+    def _run_and_monitor(self, cmd):
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
-    # ---------- UI event processing ----------
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, 
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                startupinfo=startupinfo,
+                bufsize=1
+            )
+            re_prog = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
+
+            for line in process.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                m = re_prog.search(line)
+                if m:
+                    try:
+                        pct = float(m.group(1))
+                        self.events.put(("progress", pct))
+                    except:
+                        pass
+                else:
+                    # GUIには全部流さないが、コンソールにはエラーっぽいものだけ出す？
+                    # ここでは全て流すと多すぎるので、ERRORだけprintする
+                    if "ERROR" in line:
+                        console_log(f"    (yt-dlp) {line}")
+
+                    if line.startswith("[") and "download" not in line:
+                        self.events.put(("log_line", line))
+            
+            process.wait()
+            return process.returncode == 0
+
+        except Exception as e:
+            console_log(f"  [Error] subprocess例外: {e}")
+            self.events.put(("error", str(e)))
+            return False
+
+    # ---------- Event Loop ----------
     def process_events(self):
         try:
             while True:
                 kind, payload = self.events.get_nowait()
                 if kind == "progress":
-                    self._handle_progress(payload)
+                    self.pb.configure(value=payload)
+                    self.var_status.set(f"[{self.current_task_idx}/{self.total_tasks}] DL中... {payload}%")
+                elif kind == "log_line":
+                    if len(payload) < 60:
+                        self.var_status.set(payload)
                 elif kind == "done":
-                    self._on_done(payload)
+                    self._handle_task_done(payload)
                 elif kind == "error":
-                    self._on_error(payload)
+                    self._log(f"エラー: {payload}")
                 elif kind == "info":
-                    self._on_info(payload)
+                    self._log(f"タイトル: {payload.get('title')}")
                 elif kind == "note":
                     self._log(str(payload))
                 elif kind == "post_extract_log":
                     self._log(str(payload))
                 elif kind == "post_extract_done":
-                    self._log("（事後処理）完了しました。")
-                    self.var_status.set("完了しました")
+                    console_log("  [Step] タスク完了。次へ。")
+                    self.after(100, self.start_next_download)
         except queue.Empty:
             pass
         finally:
             self.after(100, self.process_events)
 
-    def _handle_progress(self, d: dict):
-        status = d.get("status")
-        if status == "downloading":
-            percent_str = d.get("_percent_str", "0.0%").strip()
-            try:
-                percent_val = float(percent_str.replace("%", ""))
-            except Exception:
-                percent_val = 0.0
-            self.pb.configure(value=percent_val)
-            speed = d.get("_speed_str", "")
-            eta = d.get("_eta_str", "")
-            self.var_status.set(
-                f"ダウンロード中... {percent_str}  速度:{speed}  残り:{eta}"
-            )
-        elif status == "finished":
-            self.var_status.set("結合/後処理中...")
-        else:
-            self.var_status.set(status or "進行中...")
-
-    def _json_download(self, url, path):
-        ydl_opts = {
-            "quiet": True,
-            "skip_download": True,
-            "writethumbnail": True,
-            "writesubtitles": True,
-            "subtitleslangs": ["ja", "en"],
-            "cookiesfrombrowser": ("chrome",),
-            "noplaylist": True,
-        }
-        os.makedirs(path, exist_ok=True)
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        filepath = os.path.join(path, "video_info.json")
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(info, f, ensure_ascii=False, indent=2)
-
-    def _on_info(self, payload: dict):
-        title = payload.get("title", "")
-        if title:
-            self._log(f"対象: {title}")
-
-    def _on_done(self, payload: dict):
-        self._log("ダウンロード完了")
-        self.pb.configure(value=100)
-        self.btn_start.configure(state="normal")
-        self.var_status.set("ダウンロード完了")
+    def _handle_task_done(self, payload):
         outdir = payload.get("outdir")
-        is_ragtag = payload.get("is_ragtag", False)
+        is_ragtag = payload.get("is_ragtag")
+        has_error = payload.get("error")
+
+        if has_error:
+            console_log("  [Warn] エラーのため事後処理をスキップ")
+            self.after(500, self.start_next_download)
+            return
+
         if self.var_post_extract.get() and outdir:
-            self._log("（事後処理）ragtag結合 / 音声抽出 を開始します...")
+            console_log("  [Step] 事後処理スレッド起動 (FFmpeg)")
             threading.Thread(
                 target=self._post_extract_worker,
                 args=(Path(outdir), bool(is_ragtag)),
                 daemon=True,
             ).start()
+        else:
+            console_log("  [Info] 事後処理なし")
+            self.after(500, self.start_next_download)
 
-    def _on_error(self, msg: str):
-        self._log("エラー: " + str(msg))
-        self.var_status.set("エラーが発生しました")
-        self.btn_start.configure(state="normal")
-
-    def _log(self, text: str):
-        self.txt.configure(state="normal")
-        self.txt.insert("end", text + "\n")
-        self.txt.see("end")
-        self.txt.configure(state="disabled")
-
-    # 事後処理スレッド
-    def _post_extract_worker(self, outdir: Path, is_ragtag: bool):
-        def log_cb(s: str):
+    def _post_extract_worker(self, outdir, is_ragtag):
+        def log_cb(s):
             self.events.put(("post_extract_log", s))
-
         try:
-            # 1) ragtag ならまず映像＋音声の結合を試みる
             if is_ragtag:
                 mux_ragtag_av(outdir, log_cb=log_cb)
-
-            # 2) そのあと共通の「音声抽出」
             extract_all_audios(outdir, log_cb=log_cb)
         except Exception as e:
-            log_cb(f"（事後処理）エラー: {e}")
+            console_log(f"  [Error] 事後処理例外: {e}")
+            log_cb(f"事後処理エラー: {e}")
         finally:
             self.events.put(("post_extract_done", {}))
 
+    def _log(self, text):
+        self.txt_log.configure(state="normal")
+        self.txt_log.insert("end", text + "\n")
+        self.txt_log.see("end")
+        self.txt_log.configure(state="disabled")
 
 if __name__ == "__main__":
     app = YTDLPDownloaderGUI()
