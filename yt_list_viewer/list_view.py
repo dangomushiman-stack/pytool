@@ -106,6 +106,7 @@ class VideoRow:
     upload_date: Optional[str]
     webpage_url: Optional[str]
     info_timestamp: Optional[str]   # video_info.json の更新日時 "YYYY-MM-DD HH:MM:SS"
+    has_llc_file: bool # LLCファイルの有無 (追加)
 
 
 # ------------------ ユーティリティ ------------------ #
@@ -191,6 +192,11 @@ def collect_rows(root: Path, on_progress=None) -> List[VideoRow]:
             timestamp = datetime.datetime.fromtimestamp(t).strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
+        
+        # LLCファイルの存在チェック
+        # フォルダ直下に .llc ファイルがあるかを確認
+        has_llc_file = any(p.suffix.lower() == ".llc" for p in child.iterdir() if p.is_file())
+
 
         if info_raw:
             parsed = parse_video_info(info_raw)
@@ -231,6 +237,7 @@ def collect_rows(root: Path, on_progress=None) -> List[VideoRow]:
                 upload_date=upload_date,
                 webpage_url=webpage_url,
                 info_timestamp=timestamp,
+                has_llc_file=has_llc_file,
             )
         )
 
@@ -250,6 +257,7 @@ class VideoBrowserGUI(ttk.Frame):
         "video_id",
         "duration",
         "best_height",
+        "has_llc_file",  # LLCファイル有無の列を追加
         "uploader",
         "upload_date",
         "webpage_url",
@@ -384,6 +392,7 @@ class VideoBrowserGUI(ttk.Frame):
             "video_id": "動画ID",
             "duration": "長さ",
             "best_height": "最大高さ(px)",
+            "has_llc_file": "LLC",  # 見出しを追加
             "uploader": "投稿者",
             "upload_date": "投稿日",
             "webpage_url": "URL",
@@ -396,6 +405,7 @@ class VideoBrowserGUI(ttk.Frame):
             "video_id": 120,
             "duration": 80,
             "best_height": 110,
+            "has_llc_file": 50,  # 幅を調整
             "uploader": 160,
             "upload_date": 100,
             "webpage_url": 220,
@@ -408,7 +418,9 @@ class VideoBrowserGUI(ttk.Frame):
                 text=headings.get(cid, cid),
                 command=lambda c=cid: self.sort_by_column(c),
             )
-            self.tree.column(cid, width=widths.get(cid, 120), anchor=tk.W)
+            # LLC列は中央寄せ
+            anchor = tk.CENTER if cid == "has_llc_file" else tk.W
+            self.tree.column(cid, width=widths.get(cid, 120), anchor=anchor)
 
         # === 詳細エリア ===
         detail = ttk.LabelFrame(self, text="詳細 / サムネイル")
@@ -446,6 +458,7 @@ class VideoBrowserGUI(ttk.Frame):
 
     # ---------- 共通ヘルパー ---------- #
     def _row_to_values(self, r: VideoRow):
+        llc_display = "○" if r.has_llc_file else ""
         return (
             r.folder,
             r.title or "",
@@ -453,6 +466,7 @@ class VideoBrowserGUI(ttk.Frame):
             r.video_id or "",
             r.duration or "",
             r.best_height if r.best_height is not None else "",
+            llc_display,  # LLCファイルの有無を表示
             r.uploader or "",
             r.upload_date or "",
             r.webpage_url or "",
@@ -524,6 +538,10 @@ class VideoBrowserGUI(ttk.Frame):
                     return int(val)
                 except Exception:
                     return -1
+            # LLC列はブール値でソート (True=○が上/下になるように)
+            if col == "has_llc_file":
+                return r.has_llc_file
+            
             return str(val).lower()
 
         self.view_rows.sort(key=sort_key, reverse=reverse)
@@ -610,6 +628,7 @@ class VideoBrowserGUI(ttk.Frame):
                 f"動画ID: {row.video_id or ''}\n"
                 f"長さ: {row.duration or ''}\n"
                 f"最大高さ(px): {row.best_height or ''}\n"
+                f"LLCファイル: {'あり' if row.has_llc_file else 'なし'}\n" # 詳細表示に追加
                 f"投稿者: {row.uploader or ''}\n"
                 f"投稿日: {row.upload_date or ''}\n"
                 f"URL: {row.webpage_url or ''}\n"
