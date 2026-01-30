@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-yt-dlp GUIラッパー（CLI直接実行版 + 標準出力Verbose）
+yt-dlp GUIラッパー（最終版：Cookie ON/OFF切替機能付き）
  
 機能:
+  - Cookie利用 (Chrome) のON/OFF切り替え
   - 複数URLの一括ダウンロード
-  - 事前フォルダ存在チェック
-  - CLI (yt-dlp) 直接呼び出しによる安定化
-  - コンソールへの進行状況出力 (print)
+  - HLS(m3u8)の進捗表示対応
+  - 403エラー回避のためのUser-Agent設定
 """
 
 import os
@@ -49,7 +49,6 @@ def console_log(msg):
 
 # ---------------------- ffmpeg/ffprobe ユーティリティ ----------------------
 def _run(cmd):
-    # Windowsでウィンドウを出さないための設定
     startupinfo = None
     if os.name == 'nt':
         startupinfo = subprocess.STARTUPINFO()
@@ -249,7 +248,7 @@ def derive_savedir_from_url(url: str, base_outdir: str) -> str:
 class YTDLPDownloaderGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("yt-dlp Downloader (Console Verbose)")
+        self.title("yt-dlp Downloader (Cookie Toggle)")
         self.geometry("820x680")
         self.minsize(720, 520)
 
@@ -294,12 +293,20 @@ class YTDLPDownloaderGUI(tk.Tk):
         
         frm_checks = ttk.Frame(grp_sel)
         frm_checks.pack(fill=tk.X, anchor=tk.W, pady=(8,0))
+        
+        # チェックボックス類
         self.var_thumb = tk.BooleanVar(value=True)
         ttk.Checkbutton(frm_checks, text="サムネイル保存", variable=self.var_thumb).pack(side=tk.LEFT)
+        
         self.var_extra_audio = tk.BooleanVar(value=True)
         ttk.Checkbutton(frm_checks, text="（動画時）Audio別途保存", variable=self.var_extra_audio).pack(side=tk.LEFT, padx=16)
+        
         self.var_post_extract = tk.BooleanVar(value=True)
         ttk.Checkbutton(frm_checks, text="完了後に結合/音声抽出を実行", variable=self.var_post_extract).pack(side=tk.LEFT, padx=16)
+        
+        # 【追加】Cookie使用切り替え（デフォルトOFF）
+        self.var_cookie = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm_checks, text="Cookie利用 (Chrome)", variable=self.var_cookie).pack(side=tk.LEFT, padx=16)
 
         frm_btn = ttk.Frame(self, padding=(12, 0))
         frm_btn.pack(fill=tk.X)
@@ -404,23 +411,31 @@ class YTDLPDownloaderGUI(tk.Tk):
         content = self.var_content.get()
         want_thumb = self.var_thumb.get()
         extra_audio = self.var_extra_audio.get()
+        
+        # Cookie設定の値を取得
+        use_cookie = self.var_cookie.get()
 
         # JSON取得（CLI実行）
-        threading.Thread(target=self._run_json_dump, args=(url, savedir), daemon=True).start()
+        threading.Thread(target=self._run_json_dump, args=(url, savedir, use_cookie), daemon=True).start()
 
         # ダウンロードワーカー起動
         self.worker = threading.Thread(
             target=self.download_worker_cli,
-            args=(url, savedir, content, want_thumb, extra_audio),
+            args=(url, savedir, content, want_thumb, extra_audio, use_cookie),
             daemon=True,
         )
         self.worker.start()
 
     # ---------- Worker (CLI Call) ----------
-    def _run_json_dump(self, url, savedir):
+    def _run_json_dump(self, url, savedir, use_cookie):
         """メタデータを --dump-json で取得して保存"""
         console_log("  [Step] メタデータ(JSON)取得中...")
-        cmd = ["yt-dlp", "--dump-json", "--skip-download", "--cookies-from-browser", "chrome", url]
+        
+        cmd = ["yt-dlp", "--dump-json", "--skip-download", url]
+        if use_cookie:
+            cmd.extend(["--cookies-from-browser", "chrome"])
+            console_log("    (Cookie: ON)")
+
         try:
             startupinfo = None
             if os.name == 'nt':
@@ -439,7 +454,7 @@ class YTDLPDownloaderGUI(tk.Tk):
         except Exception as e:
             console_log(f"  [Error] JSON取得例外: {e}")
 
-    def download_worker_cli(self, url, outdir, content, want_thumb, extra_audio):
+    def download_worker_cli(self, url, outdir, content, want_thumb, extra_audio, use_cookie):
         parsed = urlparse(url)
         is_ragtag = "ragtag" in (parsed.netloc or "")
 
@@ -448,16 +463,22 @@ class YTDLPDownloaderGUI(tk.Tk):
         # ベースコマンド
         cmd = ["yt-dlp"]
         cmd.extend(["-o", os.path.join(outdir, "%(title)s.%(ext)s")])
+        
+        # 基本オプション
         cmd.extend([
-            "--cookies-from-browser", "chrome",
             "--retries", "20",
             "--fragment-retries", "50",
             "--file-access-retries", "10",
             "--extractor-retries", "10",
             "--retry-sleep", "2",
             "--newline",
-            "--no-colors"
+            "--no-colors",
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ])
+
+        # 【追加】Cookie使用切り替え
+        if use_cookie:
+            cmd.extend(["--cookies-from-browser", "chrome"])
 
         if not is_ragtag:
             cmd.append("--no-playlist")
@@ -495,8 +516,13 @@ class YTDLPDownloaderGUI(tk.Tk):
             self.events.put(("note", "別途音声トラック取得中(CLI)..."))
             cmd2 = ["yt-dlp"]
             cmd2.extend(["-o", os.path.join(outdir, "%(title)s [audio].%(ext)s")])
-            cmd2.extend(["--cookies-from-browser", "chrome", "--newline", "--no-colors"])
+            
+            cmd2.extend(["--newline", "--no-colors"])
             cmd2.extend(["-f", "bestaudio[protocol!=m3u8][vcodec=none]/bestaudio[vcodec=none]"])
+            
+            if use_cookie:
+                cmd2.extend(["--cookies-from-browser", "chrome"])
+
             if not is_ragtag:
                 cmd2.append("--no-playlist")
             cmd2.append(url)
@@ -505,6 +531,7 @@ class YTDLPDownloaderGUI(tk.Tk):
 
         self.events.put(("done", {"outdir": outdir, "is_ragtag": is_ragtag, "error": False}))
 
+    # ---------- ログ解析 ----------
     def _run_and_monitor(self, cmd):
         startupinfo = None
         if os.name == 'nt':
@@ -522,27 +549,40 @@ class YTDLPDownloaderGUI(tk.Tk):
                 startupinfo=startupinfo,
                 bufsize=1
             )
-            re_prog = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
+            
+            re_percent = re.compile(r"(\d+(?:\.\d+)?)%")
+            re_fragment = re.compile(r"Fragment\s+(\d+)\s*/\s*(\d+)")
 
             for line in process.stdout:
                 line = line.strip()
                 if not line:
                     continue
                 
-                m = re_prog.search(line)
-                if m:
+                m_pct = re_percent.search(line)
+                if m_pct:
                     try:
-                        pct = float(m.group(1))
+                        pct = float(m_pct.group(1))
                         self.events.put(("progress", pct))
                     except:
                         pass
+                
+                elif "Fragment" in line:
+                    m_frag = re_fragment.search(line)
+                    if m_frag:
+                        try:
+                            current = int(m_frag.group(1))
+                            total = int(m_frag.group(2))
+                            if total > 0:
+                                pct = (current / total) * 100
+                                self.events.put(("progress", pct))
+                        except:
+                            pass
+                    self.events.put(("log_line", line))
+
                 else:
-                    # GUIには全部流さないが、コンソールにはエラーっぽいものだけ出す？
-                    # ここでは全て流すと多すぎるので、ERRORだけprintする
                     if "ERROR" in line:
                         console_log(f"    (yt-dlp) {line}")
-
-                    if line.startswith("[") and "download" not in line:
+                    if line.startswith("["):
                         self.events.put(("log_line", line))
             
             process.wait()
@@ -560,9 +600,9 @@ class YTDLPDownloaderGUI(tk.Tk):
                 kind, payload = self.events.get_nowait()
                 if kind == "progress":
                     self.pb.configure(value=payload)
-                    self.var_status.set(f"[{self.current_task_idx}/{self.total_tasks}] DL中... {payload}%")
+                    self.var_status.set(f"[{self.current_task_idx}/{self.total_tasks}] DL中... {payload:.1f}%")
                 elif kind == "log_line":
-                    if len(payload) < 60:
+                    if len(payload) < 80:
                         self.var_status.set(payload)
                 elif kind == "done":
                     self._handle_task_done(payload)
