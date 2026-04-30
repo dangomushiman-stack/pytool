@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-yt-dlp GUIラッパー（最終版：Cookie ON/OFF切替機能付き）
+yt-dlp GUIラッパー（修正版：フォーマット指定を標準化 + Deno対応 + DLリスト + 右クリック展開）
  
 機能:
   - Cookie利用 (Chrome) のON/OFF切り替え
+  - YouTubeダウンロード時の PO Token 対策 (--js-runtimes deno) 自動適用
+  - フォーマット指定を手動実行時と同様の標準設定に変更 (音声抜け対策)
   - 複数URLの一括ダウンロード
-  - HLS(m3u8)の進捗表示対応
-  - 403エラー回避のためのUser-Agent設定
+  - ダウンロード状況のリスト表示機能
+  - リスト右クリックで保存先フォルダを開く機能
 """
 
 import os
+import sys
 import threading
 import queue
 import tkinter as tk
@@ -248,9 +251,9 @@ def derive_savedir_from_url(url: str, base_outdir: str) -> str:
 class YTDLPDownloaderGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("yt-dlp Downloader (Cookie Toggle)")
-        self.geometry("820x680")
-        self.minsize(720, 520)
+        self.title("yt-dlp Downloader (Cookie+Deno+List+Menu)")
+        self.geometry("820x780")
+        self.minsize(720, 600)
 
         self.events = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -258,6 +261,7 @@ class YTDLPDownloaderGUI(tk.Tk):
         self.url_queue: list[str] = []
         self.total_tasks = 0
         self.current_task_idx = 0
+        self.task_item_ids = []
 
         self.settings = load_settings()
 
@@ -272,6 +276,28 @@ class YTDLPDownloaderGUI(tk.Tk):
         scr = ttk.Scrollbar(frm_text, command=self.txt_url.yview)
         scr.pack(side=tk.RIGHT, fill=tk.Y)
         self.txt_url.configure(yscrollcommand=scr.set)
+
+        # --- ダウンロードリスト ---
+        ttk.Label(frm_top, text="ダウンロードリスト").pack(anchor=tk.W, pady=(8, 2))
+        frm_list = ttk.Frame(frm_top)
+        frm_list.pack(fill=tk.X)
+        self.tree_urls = ttk.Treeview(frm_list, columns=("Status", "URL"), show="headings", height=5)
+        self.tree_urls.heading("Status", text="状態")
+        self.tree_urls.column("Status", width=80, anchor="center")
+        self.tree_urls.heading("URL", text="URL")
+        self.tree_urls.column("URL", width=600, anchor="w")
+        scr_tree = ttk.Scrollbar(frm_list, command=self.tree_urls.yview)
+        scr_tree.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree_urls.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.tree_urls.configure(yscrollcommand=scr_tree.set)
+
+        # --- 右クリックメニューの追加 ---
+        self.tree_menu = tk.Menu(self, tearoff=0)
+        self.tree_menu.add_command(label="保存先フォルダを開く", command=self._open_selected_folder)
+        # Windows/Linuxは<Button-3>、一部Mac環境考慮でバインド
+        self.tree_urls.bind("<Button-3>", self._on_tree_right_click)
+        if sys.platform == 'darwin':
+            self.tree_urls.bind("<Button-2>", self._on_tree_right_click)
 
         frm_dir = ttk.Frame(self, padding=(12, 0))
         frm_dir.pack(fill=tk.X)
@@ -304,8 +330,8 @@ class YTDLPDownloaderGUI(tk.Tk):
         self.var_post_extract = tk.BooleanVar(value=True)
         ttk.Checkbutton(frm_checks, text="完了後に結合/音声抽出を実行", variable=self.var_post_extract).pack(side=tk.LEFT, padx=16)
         
-        # 【追加】Cookie使用切り替え（デフォルトOFF）
-        self.var_cookie = tk.BooleanVar(value=False)
+        # Cookie使用切り替え
+        self.var_cookie = tk.BooleanVar(value=True)
         ttk.Checkbutton(frm_checks, text="Cookie利用 (Chrome)", variable=self.var_cookie).pack(side=tk.LEFT, padx=16)
 
         frm_btn = ttk.Frame(self, padding=(12, 0))
@@ -329,12 +355,61 @@ class YTDLPDownloaderGUI(tk.Tk):
 
         self.after(100, self.process_events)
 
+    # --- Treeview 右クリック関連イベント ---
+    def _on_tree_right_click(self, event):
+        """リストの右クリック時にメニューを表示する"""
+        item_id = self.tree_urls.identify_row(event.y)
+        if item_id:
+            # クリックされた行を選択状態にする
+            self.tree_urls.selection_set(item_id)
+            self.tree_urls.focus(item_id)
+            
+            # URLから保存先フォルダを特定して存在確認
+            values = self.tree_urls.item(item_id, "values")
+            if len(values) >= 2:
+                url = values[1]
+                outdir_base = self.var_outdir.get().strip()
+                savedir = derive_savedir_from_url(url, outdir_base)
+                
+                # フォルダが既に存在する場合のみポップアップを表示
+                if os.path.isdir(savedir):
+                    self.tree_menu.tk_popup(event.x_root, event.y_root)
+
+    def _open_selected_folder(self):
+        """選択された行のフォルダをOSのエクスプローラーで開く"""
+        selection = self.tree_urls.selection()
+        if not selection:
+            return
+            
+        item_id = selection[0]
+        values = self.tree_urls.item(item_id, "values")
+        if len(values) >= 2:
+            url = values[1]
+            outdir_base = self.var_outdir.get().strip()
+            savedir = derive_savedir_from_url(url, outdir_base)
+            
+            if os.path.isdir(savedir):
+                if os.name == 'nt':
+                    os.startfile(savedir)
+                elif sys.platform == 'darwin':
+                    subprocess.Popen(["open", savedir])
+                else:
+                    subprocess.Popen(["xdg-open", savedir])
+    # -----------------------------------
+
     def browse_outdir(self):
         path = filedialog.askdirectory(initialdir=self.var_outdir.get() or os.path.expanduser("~"))
         if path:
             self.var_outdir.set(path)
             self.settings["last_outdir"] = path
             save_settings(self.settings)
+
+    def _update_task_status(self, status_str):
+        """現在のタスクのTreeviewステータスを更新する"""
+        if self.task_item_ids and 0 < self.current_task_idx <= len(self.task_item_ids):
+            item_id = self.task_item_ids[self.current_task_idx - 1]
+            self.tree_urls.set(item_id, column="Status", value=status_str)
+            self.tree_urls.see(item_id)
 
     def on_start(self):
         raw_text = self.txt_url.get("1.0", "end").strip()
@@ -379,6 +454,14 @@ class YTDLPDownloaderGUI(tk.Tk):
                 console_log("ユーザーキャンセルにより中止")
                 return
 
+        # リストをクリアして再登録
+        for item in self.tree_urls.get_children():
+            self.tree_urls.delete(item)
+        self.task_item_ids = []
+        for url in lines:
+            item_id = self.tree_urls.insert("", "end", values=("⏳ 待機", url))
+            self.task_item_ids.append(item_id)
+
         self.url_queue = lines
         self.total_tasks = len(lines)
         self.current_task_idx = 0
@@ -397,6 +480,10 @@ class YTDLPDownloaderGUI(tk.Tk):
 
         url = self.url_queue.pop(0)
         self.current_task_idx += 1
+        
+        # UI上のステータスを更新
+        self._update_task_status("▶️ 処理中")
+
         outdir_base = self.var_outdir.get().strip()
         savedir = derive_savedir_from_url(url, outdir_base)
         os.makedirs(savedir, exist_ok=True)
@@ -432,6 +519,12 @@ class YTDLPDownloaderGUI(tk.Tk):
         console_log("  [Step] メタデータ(JSON)取得中...")
         
         cmd = ["yt-dlp", "--dump-json", "--skip-download", url]
+        
+        # YouTube判定 & Deno追加
+        is_youtube = extract_youtube_id(url) is not None
+        if is_youtube:
+            cmd.extend(["--js-runtimes", "deno"])
+
         if use_cookie:
             cmd.extend(["--cookies-from-browser", "chrome"])
             console_log("    (Cookie: ON)")
@@ -451,12 +544,15 @@ class YTDLPDownloaderGUI(tk.Tk):
                 console_log("  [Step] JSON保存完了")
             else:
                 console_log("  [Step] JSON取得失敗 (Skip)")
+                console_log(f"    -> Stderr: {proc.stderr}")
         except Exception as e:
             console_log(f"  [Error] JSON取得例外: {e}")
 
     def download_worker_cli(self, url, outdir, content, want_thumb, extra_audio, use_cookie):
         parsed = urlparse(url)
         is_ragtag = "ragtag" in (parsed.netloc or "")
+        # YouTube判定
+        is_youtube = extract_youtube_id(url) is not None
 
         console_log("  [Step] メインダウンロード開始 (yt-dlp)...")
 
@@ -476,7 +572,11 @@ class YTDLPDownloaderGUI(tk.Tk):
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ])
 
-        # 【追加】Cookie使用切り替え
+        # YouTubeの場合は Deno を有効化
+        if is_youtube:
+            cmd.extend(["--js-runtimes", "deno"])
+
+        # Cookie使用切り替え
         if use_cookie:
             cmd.extend(["--cookies-from-browser", "chrome"])
 
@@ -488,6 +588,7 @@ class YTDLPDownloaderGUI(tk.Tk):
             cmd.extend(["--convert-thumbnails", "jpg"])
 
         if is_ragtag:
+            # Ragtag等の処理（変更なし）
             pass 
         else:
             if content == "audio":
@@ -495,7 +596,7 @@ class YTDLPDownloaderGUI(tk.Tk):
             elif content == "video_only":
                 cmd.extend(["-f", "bestvideo/best"])
             else:
-                cmd.extend(["-f", "bestvideo*+bestaudio*/best"])
+                cmd.extend(["-f", "bestvideo+bestaudio/best"])
 
         cmd.append(url)
 
@@ -520,6 +621,10 @@ class YTDLPDownloaderGUI(tk.Tk):
             cmd2.extend(["--newline", "--no-colors"])
             cmd2.extend(["-f", "bestaudio[protocol!=m3u8][vcodec=none]/bestaudio[vcodec=none]"])
             
+            # 追加音声取得時も YouTube なら Deno 適用
+            if is_youtube:
+                cmd2.extend(["--js-runtimes", "deno"])
+
             if use_cookie:
                 cmd2.extend(["--cookies-from-browser", "chrome"])
 
@@ -607,6 +712,7 @@ class YTDLPDownloaderGUI(tk.Tk):
                 elif kind == "done":
                     self._handle_task_done(payload)
                 elif kind == "error":
+                    self._update_task_status("❌ エラー")
                     self._log(f"エラー: {payload}")
                 elif kind == "info":
                     self._log(f"タイトル: {payload.get('title')}")
@@ -615,6 +721,7 @@ class YTDLPDownloaderGUI(tk.Tk):
                 elif kind == "post_extract_log":
                     self._log(str(payload))
                 elif kind == "post_extract_done":
+                    self._update_task_status("✅ 完了")
                     console_log("  [Step] タスク完了。次へ。")
                     self.after(100, self.start_next_download)
         except queue.Empty:
@@ -629,11 +736,13 @@ class YTDLPDownloaderGUI(tk.Tk):
 
         if has_error:
             console_log("  [Warn] エラーのため事後処理をスキップ")
+            self._update_task_status("❌ 失敗")
             self.after(500, self.start_next_download)
             return
 
         if self.var_post_extract.get() and outdir:
             console_log("  [Step] 事後処理スレッド起動 (FFmpeg)")
+            self._update_task_status("⚙️ 事後処理")
             threading.Thread(
                 target=self._post_extract_worker,
                 args=(Path(outdir), bool(is_ragtag)),
@@ -641,6 +750,7 @@ class YTDLPDownloaderGUI(tk.Tk):
             ).start()
         else:
             console_log("  [Info] 事後処理なし")
+            self._update_task_status("✅ 完了")
             self.after(500, self.start_next_download)
 
     def _post_extract_worker(self, outdir, is_ragtag):
