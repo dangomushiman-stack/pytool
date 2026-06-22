@@ -9,6 +9,7 @@ yt-dlp GUIラッパー（修正版：フォーマット指定を標準化 + Deno
   - 複数URLの一括ダウンロード
   - ダウンロード状況のリスト表示機能
   - リスト右クリックで保存先フォルダを開く機能
+  - 成功したCLI相当の最小構成モード
 """
 
 import os
@@ -334,6 +335,13 @@ class YTDLPDownloaderGUI(tk.Tk):
         self.var_cookie = tk.BooleanVar(value=True)
         ttk.Checkbutton(frm_checks, text="Cookie利用 (Chrome)", variable=self.var_cookie).pack(side=tk.LEFT, padx=16)
 
+        self.var_cli_compat = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frm_checks,
+            text="成功CLI相当モード（最小構成）",
+            variable=self.var_cli_compat,
+        ).pack(side=tk.LEFT, padx=16)
+
         frm_btn = ttk.Frame(self, padding=(12, 0))
         frm_btn.pack(fill=tk.X)
         self.btn_start = ttk.Button(frm_btn, text="一括ダウンロード開始", command=self.on_start)
@@ -501,20 +509,26 @@ class YTDLPDownloaderGUI(tk.Tk):
         
         # Cookie設定の値を取得
         use_cookie = self.var_cookie.get()
+        cli_compat = self.var_cli_compat.get()
+
+        if cli_compat:
+            console_log("  [Mode] 成功CLI相当モード: yt-dlp + cookies + URL の最小構成で実行")
 
         # JSON取得（CLI実行）
-        threading.Thread(target=self._run_json_dump, args=(url, savedir, use_cookie), daemon=True).start()
+        # 成功CLI相当モードでは、手動実行に近づけるためメタデータ取得の別プロセスを起動しません。
+        if not cli_compat:
+            threading.Thread(target=self._run_json_dump, args=(url, savedir, use_cookie, cli_compat), daemon=True).start()
 
         # ダウンロードワーカー起動
         self.worker = threading.Thread(
             target=self.download_worker_cli,
-            args=(url, savedir, content, want_thumb, extra_audio, use_cookie),
+            args=(url, savedir, content, want_thumb, extra_audio, use_cookie, cli_compat),
             daemon=True,
         )
         self.worker.start()
 
     # ---------- Worker (CLI Call) ----------
-    def _run_json_dump(self, url, savedir, use_cookie):
+    def _run_json_dump(self, url, savedir, use_cookie, cli_compat=False):
         """メタデータを --dump-json で取得して保存"""
         console_log("  [Step] メタデータ(JSON)取得中...")
         
@@ -522,7 +536,7 @@ class YTDLPDownloaderGUI(tk.Tk):
         
         # YouTube判定 & Deno追加
         is_youtube = extract_youtube_id(url) is not None
-        if is_youtube:
+        if is_youtube and not cli_compat:
             cmd.extend(["--js-runtimes", "deno"])
 
         if use_cookie:
@@ -548,13 +562,34 @@ class YTDLPDownloaderGUI(tk.Tk):
         except Exception as e:
             console_log(f"  [Error] JSON取得例外: {e}")
 
-    def download_worker_cli(self, url, outdir, content, want_thumb, extra_audio, use_cookie):
+    def download_worker_cli(self, url, outdir, content, want_thumb, extra_audio, use_cookie, cli_compat=False):
         parsed = urlparse(url)
         is_ragtag = "ragtag" in (parsed.netloc or "")
         # YouTube判定
         is_youtube = extract_youtube_id(url) is not None
 
         console_log("  [Step] メインダウンロード開始 (yt-dlp)...")
+
+        if cli_compat:
+            # 成功した手動CLIにできるだけ近い最小構成。
+            # 例: yt-dlp --cookies-from-browser chrome "URL"
+            # GUIの保存先だけは維持するため -o のみ追加します。
+            cmd = ["yt-dlp"]
+            cmd.extend(["-o", os.path.join(outdir, "%(title)s.%(ext)s")])
+            if use_cookie:
+                cmd.extend(["--cookies-from-browser", "chrome"])
+            cmd.append(url)
+
+            success = self._run_and_monitor(cmd)
+            if not success:
+                console_log("  [Error] メインダウンロード失敗")
+                self.events.put(("error", "yt-dlp コマンドがエラー終了しました"))
+                self.events.put(("done", {"outdir": outdir, "is_ragtag": is_ragtag, "error": True, "cli_compat": True}))
+                return
+
+            console_log("  [Step] メインダウンロード完了")
+            self.events.put(("done", {"outdir": outdir, "is_ragtag": is_ragtag, "error": False, "cli_compat": True}))
+            return
 
         # ベースコマンド
         cmd = ["yt-dlp"]
@@ -737,6 +772,12 @@ class YTDLPDownloaderGUI(tk.Tk):
         if has_error:
             console_log("  [Warn] エラーのため事後処理をスキップ")
             self._update_task_status("❌ 失敗")
+            self.after(500, self.start_next_download)
+            return
+
+        if payload.get("cli_compat"):
+            console_log("  [Info] 成功CLI相当モードのため事後処理なし")
+            self._update_task_status("✅ 完了")
             self.after(500, self.start_next_download)
             return
 
