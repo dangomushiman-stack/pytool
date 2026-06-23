@@ -22,6 +22,8 @@ import re
 import json
 import subprocess
 import datetime
+import shlex
+import uuid
 from pathlib import Path
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -46,10 +48,63 @@ def save_settings(data: dict):
         pass
 
 # ---------------------- ログ出力ヘルパー ----------------------
+_log_file_lock = threading.Lock()
+
+def _create_log_file() -> Path | None:
+    """起動ごとに重複しないログファイルを作成する。"""
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    unique = uuid.uuid4().hex[:8]
+    filename = f"ytdlp_gui_{timestamp}_pid{os.getpid()}_{unique}.log"
+
+    candidates = []
+    try:
+        candidates.append(Path(__file__).resolve().parent / "logs")
+    except Exception:
+        pass
+    candidates.append(Path.cwd() / "logs")
+
+    for log_dir in candidates:
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / filename
+            with open(log_file, "x", encoding="utf-8") as f:
+                f.write("# yt-dlp GUI log\n")
+                f.write(f"# started_at: {datetime.datetime.now().isoformat(timespec='seconds')}\n")
+                f.write(f"# pid: {os.getpid()}\n")
+                f.write("\n")
+            return log_file
+        except Exception:
+            continue
+    return None
+
+LOG_FILE = _create_log_file()
+
+def file_log(msg):
+    """ログファイルに時刻付きで追記する。ファイル作成に失敗した場合は何もしない。"""
+    if LOG_FILE is None:
+        return
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    with _log_file_lock:
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"[{now}] {msg}\n")
+        except Exception:
+            pass
+
+def _format_cmd_for_log(cmd: list[str]) -> str:
+    try:
+        if os.name == 'nt':
+            return subprocess.list2cmdline([str(x) for x in cmd])
+        return " ".join(shlex.quote(str(x)) for x in cmd)
+    except Exception:
+        return repr(cmd)
+
 def console_log(msg):
-    """標準出力に時刻付きで表示"""
+    """標準出力とログファイルに時刻付きで表示"""
     now = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{now}] {msg}")
+    line = f"[{now}] {msg}"
+    print(line, flush=True)
+    file_log(msg)
 
 # ---------------------- ffmpeg/ffprobe ユーティリティ ----------------------
 def _run(cmd):
@@ -358,9 +413,11 @@ class YTDLPDownloaderGUI(tk.Tk):
         frm_log.pack(fill=tk.BOTH, expand=True)
         self.txt_log = tk.Text(frm_log, height=12, wrap="word")
         self.txt_log.pack(fill=tk.BOTH, expand=True)
-        self.txt_log.insert("end", "コンソール（標準出力）にも詳細な進捗を表示します。\n")
+        self.txt_log.insert("end", f"ログファイル: {LOG_FILE if LOG_FILE else '作成失敗'}\n")
+        self.txt_log.insert("end", "コンソール（標準出力）とログファイルに詳細な進捗を表示します。\n")
         self.txt_log.configure(state="disabled")
 
+        console_log(f"ログファイル: {LOG_FILE if LOG_FILE else '作成失敗'}")
         self.after(100, self.process_events)
 
     # --- Treeview 右クリック関連イベント ---
@@ -419,8 +476,25 @@ class YTDLPDownloaderGUI(tk.Tk):
             self.tree_urls.set(item_id, column="Status", value=status_str)
             self.tree_urls.see(item_id)
 
+    def _log_input_urls_for_run(self, raw_text: str, lines: list[str]):
+        """実行開始時点の入力欄内容と、実際の実行対象URL一覧をまとめてログ出力する。"""
+        console_log("==== 入力欄の内容（実行開始時） ====")
+        raw_lines = raw_text.splitlines()
+        if raw_lines:
+            for i, raw_line in enumerate(raw_lines, 1):
+                # 入力欄にあった内容をそのまま残す。空行も <空行> として残す。
+                display = raw_line if raw_line else "<空行>"
+                console_log(f"  input[{i:03d}]: {display}")
+        else:
+            console_log("  input: <空>")
+
+        console_log("==== 実行対象URL一覧（空行除外・前後空白除去後） ====")
+        for i, url in enumerate(lines, 1):
+            console_log(f"  target[{i}/{len(lines)}]: {url}")
+        console_log("==== 入力欄の内容ここまで ====")
+
     def on_start(self):
-        raw_text = self.txt_url.get("1.0", "end").strip()
+        raw_text = self.txt_url.get("1.0", "end-1c")
         lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
 
         if not lines:
@@ -437,6 +511,8 @@ class YTDLPDownloaderGUI(tk.Tk):
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("実行中", "現在処理中です")
             return
+
+        self._log_input_urls_for_run(raw_text, lines)
 
         # 事前チェック
         console_log("==== 事前チェック開始 ====")
@@ -500,6 +576,8 @@ class YTDLPDownloaderGUI(tk.Tk):
         self.var_status.set(f"[{self.current_task_idx}/{self.total_tasks}] 初期化中...")
         
         console_log(f"\n--- [Task {self.current_task_idx}/{self.total_tasks}] Start ---")
+        console_log(f"==== 今回ダウンロードするURL [{self.current_task_idx}/{self.total_tasks}] ====")
+        console_log(f"  Target URL: {url}")
         console_log(f"  URL: {url}")
         console_log(f"  Dir: {savedir}")
 
@@ -549,6 +627,7 @@ class YTDLPDownloaderGUI(tk.Tk):
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             
+            console_log(f"    [CMD] {_format_cmd_for_log(cmd)}")
             proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', startupinfo=startupinfo)
             if proc.returncode == 0:
                 data = json.loads(proc.stdout)
@@ -569,6 +648,7 @@ class YTDLPDownloaderGUI(tk.Tk):
         is_youtube = extract_youtube_id(url) is not None
 
         console_log("  [Step] メインダウンロード開始 (yt-dlp)...")
+        console_log(f"  [Download Target] {url}")
 
         if cli_compat:
             # 成功した手動CLIにできるだけ近い最小構成。
@@ -649,6 +729,7 @@ class YTDLPDownloaderGUI(tk.Tk):
         # 追加オーディオ（動画モード時）
         if content == "video" and extra_audio:
             console_log("  [Step] 追加オーディオトラック取得開始...")
+            console_log(f"  [Download Target] 追加オーディオ: {url}")
             self.events.put(("note", "別途音声トラック取得中(CLI)..."))
             cmd2 = ["yt-dlp"]
             cmd2.extend(["-o", os.path.join(outdir, "%(title)s [audio].%(ext)s")])
@@ -679,6 +760,7 @@ class YTDLPDownloaderGUI(tk.Tk):
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
         try:
+            console_log(f"  [CMD] {_format_cmd_for_log(cmd)}")
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -697,6 +779,8 @@ class YTDLPDownloaderGUI(tk.Tk):
                 line = line.strip()
                 if not line:
                     continue
+
+                file_log(f"    (yt-dlp) {line}")
                 
                 m_pct = re_percent.search(line)
                 if m_pct:
@@ -726,6 +810,7 @@ class YTDLPDownloaderGUI(tk.Tk):
                         self.events.put(("log_line", line))
             
             process.wait()
+            console_log(f"  [Exit] yt-dlp returncode={process.returncode}")
             return process.returncode == 0
 
         except Exception as e:
@@ -756,7 +841,12 @@ class YTDLPDownloaderGUI(tk.Tk):
                 elif kind == "post_extract_log":
                     self._log(str(payload))
                 elif kind == "post_extract_done":
-                    self._update_task_status("✅ 完了")
+                    if payload.get("error"):
+                        self._update_task_status("⚠️ 事後処理エラー")
+                        console_log(f"  [Result] ダウンロード完了 / 事後処理エラー: {payload.get('outdir')}")
+                    else:
+                        self._update_task_status("✅ 完了")
+                        console_log(f"  [Result] 完了: {payload.get('outdir')}")
                     console_log("  [Step] タスク完了。次へ。")
                     self.after(100, self.start_next_download)
         except queue.Empty:
@@ -770,12 +860,14 @@ class YTDLPDownloaderGUI(tk.Tk):
         has_error = payload.get("error")
 
         if has_error:
+            console_log("  [Result] 失敗: メインダウンロードでエラーが発生しました")
             console_log("  [Warn] エラーのため事後処理をスキップ")
             self._update_task_status("❌ 失敗")
             self.after(500, self.start_next_download)
             return
 
         if payload.get("cli_compat"):
+            console_log(f"  [Result] 完了: {outdir}")
             console_log("  [Info] 成功CLI相当モードのため事後処理なし")
             self._update_task_status("✅ 完了")
             self.after(500, self.start_next_download)
@@ -790,11 +882,13 @@ class YTDLPDownloaderGUI(tk.Tk):
                 daemon=True,
             ).start()
         else:
+            console_log(f"  [Result] 完了: {outdir}")
             console_log("  [Info] 事後処理なし")
             self._update_task_status("✅ 完了")
             self.after(500, self.start_next_download)
 
     def _post_extract_worker(self, outdir, is_ragtag):
+        post_error = None
         def log_cb(s):
             self.events.put(("post_extract_log", s))
         try:
@@ -802,12 +896,14 @@ class YTDLPDownloaderGUI(tk.Tk):
                 mux_ragtag_av(outdir, log_cb=log_cb)
             extract_all_audios(outdir, log_cb=log_cb)
         except Exception as e:
+            post_error = str(e)
             console_log(f"  [Error] 事後処理例外: {e}")
             log_cb(f"事後処理エラー: {e}")
         finally:
-            self.events.put(("post_extract_done", {}))
+            self.events.put(("post_extract_done", {"outdir": str(outdir), "error": post_error}))
 
     def _log(self, text):
+        file_log(f"    (GUI) {text}")
         self.txt_log.configure(state="normal")
         self.txt_log.insert("end", text + "\n")
         self.txt_log.see("end")
